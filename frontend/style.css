@@ -1,0 +1,77 @@
+/* ── Custom styles for CB Tracker ── */
+
+body { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+
+.chart-container {
+  position: relative;
+  height: 220px;
+  width: 100%;
+}
+
+/* Table rows */
+#cb-table-body tr {
+  border-bottom: 1px solid #1e293b;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+#cb-table-body tr:hover { background: #1e293b; }
+
+/* Sort headers */
+th.sortable:hover { color: #93c5fd; }
+th.sortable.asc  .sort-icon::after { content: ' ↑'; }
+th.sortable.desc .sort-icon::after { content: ' ↓'; }
+
+/* Premium/discount badges */
+.badge-deep-discount { background:#166534; color:#bbf7d0; }
+.badge-discount      { background:#14532d; color:#86efac; }
+.badge-slight-disc   { background:#1a3a1a; color:#6ee78b; }
+.badge-flat          { background:#374151; color:#d1d5db; }
+.badge-slight-prem   { background:#451a03; color:#fcd34d; }
+.badge-premium       { background:#7c2d12; color:#fca5a5; }
+.badge-deep-premium  { background:#991b1b; color:#fecaca; font-weight:bold; }
+
+/* Par premium badges (CB price vs face value 100, no conversion price) */
+.badge-par-disc      { background:#14532d; color:#86efac; }
+.badge-par-flat      { background:#374151; color:#d1d5db; }
+.badge-par-prem      { background:#451a03; color:#fcd34d; }
+.badge-par-high      { background:#991b1b; color:#fecaca; }
+.badge-par-unknown   { background:#1e293b; color:#64748b; }
+
+/* Row background by premium level */
+tr.row-deep-discount { background: #0a1f0a; }
+tr.row-discount      { background: #0d1f0d; }
+tr.row-slight-disc   { }
+tr.row-flat          { }
+tr.row-slight-prem   { background: #1f1500; }
+tr.row-premium       { background: #1f0a00; }
+tr.row-deep-premium  { background: #1f0000; }
+
+/* Input field */
+.input-field {
+  background: #1e293b;
+  border: 1px solid #475569;
+  border-radius: 0.375rem;
+  padding: 0.375rem 0.625rem;
+  font-size: 0.875rem;
+  color: #e2e8f0;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.input-field:focus { border-color: #3b82f6; }
+.input-field::placeholder { color: #475569; }
+
+/* Modal animation */
+#detail-modal, #add-modal {
+  animation: fadeIn 0.15s ease;
+}
+@keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
+
+/* Loading spinner */
+.spin { animation: spin 1s linear infinite; display: inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #0f172a; }
+::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #475569; }

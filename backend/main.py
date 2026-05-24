@@ -1,0 +1,587 @@
+"""
+FastAPI entry point for CB Tracker.
+Run: uvicorn backend.main:app --reload --port 8000
+"""
+import asyncio
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from typing import Optional
+
+import aiosqlite
+import pytz
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from backend.config import DB_PATH, FRONTEND_DIR
+from backend.database import init_db, log_fetch
+from backend.fetcher import (
+    refresh_all_prices, run_full_discovery,
+    fetch_conversion_price_mops,
+    last_trading_date, sync_cb_list_from_isin,
+    sync_conversion_prices_from_cbas,
+    fetch_historical_prices_for_date,
+    backfill_history,
+)
+
+TW_TZ = pytz.timezone("Asia/Taipei")
+scheduler = AsyncIOScheduler(timezone=TW_TZ)
+
+
+# ──────────────────────────────────────────────────────────
+# Global state: track background discovery task
+# ──────────────────────────────────────────────────────────
+
+_discovery_status = {"running": False, "progress": 0, "message": "idle", "last_result": None}
+
+
+# ──────────────────────────────────────────────────────────
+# Lifespan
+# ──────────────────────────────────────────────────────────
+
+async def _scheduled_daily_fetch():
+    """Called by APScheduler every weekday at 14:35 Taiwan time."""
+    print("[Scheduler] Daily auto-fetch triggered")
+    await refresh_all_prices()
+    await sync_conversion_prices_from_cbas()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    # Daily auto-fetch: weekdays at 14:35 (after TWSE/TPEX close at 13:30)
+    scheduler.add_job(
+        _scheduled_daily_fetch, "cron",
+        day_of_week="mon-fri", hour=14, minute=35,
+        id="daily_fetch", replace_existing=True,
+    )
+    scheduler.start()
+    asyncio.create_task(_auto_start_if_needed())
+    yield
+    scheduler.shutdown()
+
+
+async def _auto_start_if_needed():
+    """On startup: run full discovery if we have no CB data at all."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM convertible_bonds WHERE is_active=1")
+        count = (await cur.fetchone())[0]
+    if count == 0:
+        print("[Startup] No CBs in DB — triggering full discovery automatically...")
+        await _run_discovery_bg()
+    else:
+        # Refresh prices for today if missing
+        trade_date = last_trading_date()
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT COUNT(*) FROM cb_prices WHERE trade_date=?", (trade_date,))
+            price_count = (await cur.fetchone())[0]
+        if price_count == 0:
+            print(f"[Startup] No prices for {trade_date} — refreshing...")
+            await refresh_all_prices(trade_date)
+        # Always sync conversion prices on startup
+        print("[Startup] Syncing conversion prices from CBAS...")
+        asyncio.create_task(sync_conversion_prices_from_cbas())
+
+
+async def _run_discovery_bg():
+    """Run full market scan in background, update _discovery_status."""
+    global _discovery_status
+    _discovery_status = {"running": True, "progress": 0, "message": "正在從 ISIN 資料庫獲取可轉債清單...", "last_result": None}
+
+    def on_progress(pct: int, msg: str):
+        global _discovery_status
+        _discovery_status = {**_discovery_status, "progress": pct, "message": msg}
+
+    try:
+        result = await run_full_discovery(progress_callback=on_progress)
+        _discovery_status = {
+            "running": False,
+            "progress": 100,
+            "message": f"完成！找到 {result.get('active_cbs_found', 0)} 筆可轉債，{result.get('cb_prices_saved', 0)} 筆有價格",
+            "last_result": result,
+        }
+    except Exception as e:
+        _discovery_status = {"running": False, "progress": -1, "message": f"錯誤: {e}", "last_result": None}
+
+
+# ──────────────────────────────────────────────────────────
+# App
+# ──────────────────────────────────────────────────────────
+
+app = FastAPI(title="可轉債折溢價追蹤器", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+)
+
+
+# ──────────────────────────────────────────────────────────
+# Pydantic models
+# ──────────────────────────────────────────────────────────
+
+class CBCreate(BaseModel):
+    cb_code: str
+    cb_name: str
+    stock_code: str
+    stock_name: Optional[str] = ""
+    stock_market: str = "TWSE"
+    conversion_price: Optional[float] = None
+    notes: Optional[str] = None
+
+
+class CBUpdate(BaseModel):
+    cb_name: Optional[str] = None
+    stock_code: Optional[str] = None
+    stock_name: Optional[str] = None
+    stock_market: Optional[str] = None
+    conversion_price: Optional[float] = None
+    is_active: Optional[int] = None
+    notes: Optional[str] = None
+
+
+def row_to_dict(row) -> dict:
+    return dict(row) if row else {}
+
+
+# ──────────────────────────────────────────────────────────
+# API: CB management
+# ──────────────────────────────────────────────────────────
+
+@app.get("/api/cbs")
+async def list_cbs(search: str = "", active_only: bool = True, market: str = "all"):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        where, params = ["1=1"], []
+        if active_only:
+            where.append("is_active=1")
+        if market != "all":
+            where.append("stock_market=?"); params.append(market.upper())
+        if search:
+            where.append("(cb_code LIKE ? OR cb_name LIKE ? OR stock_code LIKE ? OR stock_name LIKE ?)")
+            s = f"%{search}%"; params += [s, s, s, s]
+        cur = await db.execute(
+            f"SELECT * FROM convertible_bonds WHERE {' AND '.join(where)} ORDER BY cb_code",
+            params,
+        )
+        return [row_to_dict(r) for r in await cur.fetchall()]
+
+
+@app.post("/api/cbs", status_code=201)
+async def add_cb(cb: CBCreate):
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO convertible_bonds (cb_code,cb_name,stock_code,stock_name,stock_market,conversion_price,notes) VALUES (?,?,?,?,?,?,?)",
+                (cb.cb_code, cb.cb_name, cb.stock_code, cb.stock_name, cb.stock_market, cb.conversion_price, cb.notes),
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError:
+            raise HTTPException(409, f"CB {cb.cb_code} already exists")
+    return {"status": "created", "cb_code": cb.cb_code}
+
+
+@app.put("/api/cbs/{cb_code}")
+async def update_cb(cb_code: str, data: CBUpdate):
+    fields, params = [], []
+    for field, val in data.model_dump(exclude_none=True).items():
+        fields.append(f"{field}=?"); params.append(val)
+    if not fields:
+        raise HTTPException(400, "No fields to update")
+    params += [datetime.now().isoformat(), cb_code]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"UPDATE convertible_bonds SET {', '.join(fields)}, updated_at=? WHERE cb_code=?", params
+        )
+        await db.commit()
+
+    # If conversion_price was updated, retroactively backfill premium_history
+    if data.conversion_price is not None:
+        backfilled = await _backfill_premium(cb_code, data.conversion_price)
+        return {"status": "updated", "backfilled_days": backfilled}
+
+    return {"status": "updated"}
+
+
+async def _backfill_premium(cb_code: str, conversion_price: float) -> int:
+    """Recalculate premium_history for all stored price rows of this CB."""
+    if not conversion_price or conversion_price <= 0:
+        return 0
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Get CB stock code
+        cur = await db.execute(
+            "SELECT stock_code FROM convertible_bonds WHERE cb_code=?", (cb_code,)
+        )
+        row = await cur.fetchone()
+        if not row:
+            return 0
+        stock_code = row["stock_code"]
+
+        # Join cb_prices with stock_prices for every stored date
+        cur = await db.execute(
+            """SELECT cbp.trade_date, cbp.close_price AS cb_price, sp.close_price AS stock_price
+               FROM cb_prices cbp
+               LEFT JOIN stock_prices sp
+                 ON sp.stock_code=? AND sp.trade_date=cbp.trade_date
+               WHERE cbp.cb_code=?
+               ORDER BY cbp.trade_date""",
+            (stock_code, cb_code),
+        )
+        price_rows = await cur.fetchall()
+
+        count = 0
+        for r in price_rows:
+            cb_price = r["cb_price"]
+            stock_price = r["stock_price"]
+            if not cb_price or not stock_price:
+                continue
+            parity = stock_price * (100.0 / conversion_price)
+            premium_pct = (cb_price - parity) / parity * 100.0
+            await db.execute(
+                """INSERT OR REPLACE INTO premium_history
+                   (cb_code, trade_date, cb_price, stock_price, conversion_price, parity, premium_pct)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (cb_code, r["trade_date"], cb_price, stock_price,
+                 conversion_price, parity, premium_pct),
+            )
+            count += 1
+
+        await db.commit()
+    return count
+
+
+class BulkConversionPrice(BaseModel):
+    prices: dict  # {cb_code: conversion_price}
+
+
+@app.post("/api/cbs/bulk-conversion-price")
+async def bulk_set_conversion_prices(body: BulkConversionPrice):
+    """Set conversion prices for multiple CBs at once and backfill history."""
+    results = {}
+    for cb_code, price in body.prices.items():
+        try:
+            price_f = float(price)
+            if price_f <= 0:
+                results[cb_code] = "invalid"
+                continue
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE convertible_bonds SET conversion_price=?, updated_at=datetime('now','localtime') WHERE cb_code=?",
+                    (price_f, cb_code),
+                )
+                await db.commit()
+            backfilled = await _backfill_premium(cb_code, price_f)
+            results[cb_code] = {"ok": True, "backfilled": backfilled}
+        except Exception as e:
+            results[cb_code] = {"error": str(e)}
+    return {"status": "ok", "results": results}
+
+
+@app.delete("/api/cbs/{cb_code}")
+async def deactivate_cb(cb_code: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE convertible_bonds SET is_active=0 WHERE cb_code=?", (cb_code,))
+        await db.commit()
+    return {"status": "deactivated"}
+
+
+# ──────────────────────────────────────────────────────────
+# API: Discovery & refresh
+# ──────────────────────────────────────────────────────────
+
+@app.post("/api/discover")
+async def trigger_full_discovery():
+    """Start full market scan in background. Returns immediately."""
+    if _discovery_status["running"]:
+        return {"status": "already_running", "message": "掃描已在進行中"}
+    asyncio.create_task(_run_discovery_bg())
+    return {"status": "started", "message": "開始掃描全市場可轉債..."}
+
+
+@app.get("/api/discover/status")
+async def discovery_status():
+    return _discovery_status
+
+
+@app.post("/api/discover/sync-list")
+async def sync_cb_list():
+    """Re-sync CB list from ISIN (add new, expire old). Fast operation."""
+    result = await sync_cb_list_from_isin()
+    return result
+
+
+@app.post("/api/discover/sync-conversion-prices")
+async def sync_conv_prices():
+    """
+    Fetch latest conversion prices from CBAS Excel, update DB, backfill history.
+    Usually completes in ~5s.
+    """
+    result = await sync_conversion_prices_from_cbas()
+    return result
+
+
+@app.post("/api/discover/backfill-history")
+async def trigger_backfill(days: int = Body(60, embed=True)):
+    """
+    Backfill historical CB and stock prices for the past N trading days.
+    Fetches from TPEX OTC bond historical endpoint + TWSE/TPEX stock data.
+    Takes 1-3 minutes for 60 days. Runs synchronously (await completes when done).
+    """
+    days = max(1, min(days, 180))
+    result = await backfill_history(days)
+    return result
+
+
+@app.post("/api/discover/fetch-date")
+async def fetch_one_date(trade_date: str = Body(..., embed=True)):
+    """Fetch prices for a single specific historical date."""
+    result = await fetch_historical_prices_for_date(trade_date)
+    return result
+
+
+@app.post("/api/prices/fetch")
+async def trigger_fetch(trade_date: Optional[str] = Body(None, embed=True)):
+    """Fast refresh of prices for known CBs."""
+    result = await refresh_all_prices(trade_date)
+    return result
+
+
+# ──────────────────────────────────────────────────────────
+# API: Premium table
+# ──────────────────────────────────────────────────────────
+
+@app.get("/api/premium/today")
+async def get_today_premium(
+    trade_date: Optional[str] = None,
+    min_pct: Optional[float] = None,
+    max_pct: Optional[float] = None,
+    search: str = "",
+    sort_by: str = "premium_pct",
+    asc: bool = True,
+    include_no_conv: bool = True,
+):
+    date = trade_date or last_trading_date()
+    valid_sorts = {"premium_pct", "cb_code", "stock_code", "cb_price", "stock_price", "parity", "conversion_price"}
+    if sort_by not in valid_sorts:
+        sort_by = "premium_pct"
+    order = "ASC" if asc else "DESC"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        # CBs with premium data
+        where_ph = ["ph.trade_date=?"]
+        params_ph: list = [date]
+        if min_pct is not None:
+            where_ph.append("ph.premium_pct >= ?"); params_ph.append(min_pct)
+        if max_pct is not None:
+            where_ph.append("ph.premium_pct <= ?"); params_ph.append(max_pct)
+        if search:
+            where_ph.append("(cb.cb_code LIKE ? OR cb.cb_name LIKE ? OR cb.stock_code LIKE ? OR cb.stock_name LIKE ?)")
+            s = f"%{search}%"; params_ph += [s, s, s, s]
+
+        sql_ph = f"""
+            SELECT ph.cb_code, cb.cb_name, cb.stock_code, cb.stock_name, cb.stock_market,
+                   ph.cb_price, ph.stock_price, ph.conversion_price,
+                   ph.parity, ph.premium_pct, ph.trade_date,
+                   cbp.prev_close AS cb_prev_close, cbp.volume AS cb_volume,
+                   cb.maturity_date
+            FROM premium_history ph
+            JOIN convertible_bonds cb ON ph.cb_code=cb.cb_code
+            LEFT JOIN cb_prices cbp ON cbp.cb_code=ph.cb_code AND cbp.trade_date=ph.trade_date
+            WHERE {' AND '.join(where_ph)}
+            ORDER BY {sort_by} {order}
+        """
+        cur = await db.execute(sql_ph, params_ph)
+        rows_with = [dict(r) for r in await cur.fetchall()]
+
+        # CBs with price but no conversion price (if requested)
+        rows_without = []
+        if include_no_conv and not min_pct and not max_pct:
+            where_no = ["cbp.trade_date=?", "cb.is_active=1",
+                        "(cb.conversion_price IS NULL OR cb.conversion_price=0)"]
+            params_no: list = [date]
+            if search:
+                where_no.append("(cb.cb_code LIKE ? OR cb.cb_name LIKE ? OR cb.stock_code LIKE ? OR cb.stock_name LIKE ?)")
+                s = f"%{search}%"; params_no += [s, s, s, s]
+            sql_no = f"""
+                SELECT cb.cb_code, cb.cb_name, cb.stock_code, cb.stock_name, cb.stock_market,
+                       cbp.close_price AS cb_price, sp.close_price AS stock_price,
+                       cb.conversion_price, NULL AS parity, NULL AS premium_pct, cbp.trade_date,
+                       cbp.prev_close AS cb_prev_close, cbp.volume AS cb_volume,
+                       cb.maturity_date
+                FROM cb_prices cbp
+                JOIN convertible_bonds cb ON cbp.cb_code=cb.cb_code
+                LEFT JOIN stock_prices sp ON sp.stock_code=cb.stock_code AND sp.trade_date=cbp.trade_date
+                WHERE {' AND '.join(where_no)}
+                ORDER BY cb.cb_code ASC
+            """
+            cur = await db.execute(sql_no, params_no)
+            rows_without = [dict(r) for r in await cur.fetchall()]
+
+    def add_computed(r):
+        prev = r.get("cb_prev_close")
+        price = r.get("cb_price")
+        if prev and prev > 0 and price:
+            r["cb_change_pct"] = (price - prev) / prev * 100
+        else:
+            r["cb_change_pct"] = None
+        # Distance from par (face value = 100)
+        if price:
+            r["par_premium_pct"] = (price - 100.0) / 100.0 * 100.0
+        else:
+            r["par_premium_pct"] = None
+        return r
+
+    result = [add_computed(r) for r in rows_with] + [add_computed(r) for r in rows_without]
+    return {"date": date, "total": len(result), "with_premium": len(rows_with), "data": result}
+
+
+@app.get("/api/premium/{cb_code}/history")
+async def get_premium_history(cb_code: str, days: int = 90):
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT ph.trade_date, ph.cb_price, ph.stock_price, ph.conversion_price,
+                      ph.parity, ph.premium_pct, cbp.volume AS cb_volume
+               FROM premium_history ph
+               LEFT JOIN cb_prices cbp ON cbp.cb_code=ph.cb_code AND cbp.trade_date=ph.trade_date
+               WHERE ph.cb_code=? AND ph.trade_date>=?
+               ORDER BY ph.trade_date ASC""",
+            (cb_code, cutoff),
+        )
+        return [row_to_dict(r) for r in await cur.fetchall()]
+
+
+# ──────────────────────────────────────────────────────────
+# API: CB detail & price history
+# ──────────────────────────────────────────────────────────
+
+@app.get("/api/cbs/{cb_code}")
+async def get_cb_detail(cb_code: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM convertible_bonds WHERE cb_code=?", (cb_code,))
+        cb = row_to_dict(await cur.fetchone())
+        if not cb:
+            raise HTTPException(404, "CB not found")
+        cur = await db.execute("SELECT * FROM cb_prices WHERE cb_code=? ORDER BY trade_date DESC LIMIT 1", (cb_code,))
+        cb["latest_price"] = row_to_dict(await cur.fetchone())
+        cur = await db.execute("SELECT * FROM premium_history WHERE cb_code=? ORDER BY trade_date DESC LIMIT 1", (cb_code,))
+        cb["latest_premium"] = row_to_dict(await cur.fetchone())
+    return cb
+
+
+@app.get("/api/prices/cb/{cb_code}")
+async def get_cb_price_history(cb_code: str, days: int = 90):
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM cb_prices WHERE cb_code=? AND trade_date>=? ORDER BY trade_date ASC",
+            (cb_code, cutoff),
+        )
+        return [row_to_dict(r) for r in await cur.fetchall()]
+
+
+@app.get("/api/prices/stock/{stock_code}")
+async def get_stock_price_history(stock_code: str, days: int = 90):
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM stock_prices WHERE stock_code=? AND trade_date>=? ORDER BY trade_date ASC",
+            (stock_code, cutoff),
+        )
+        return [row_to_dict(r) for r in await cur.fetchall()]
+
+
+# ──────────────────────────────────────────────────────────
+# API: Conversion price auto-fetch
+# ──────────────────────────────────────────────────────────
+
+@app.post("/api/cbs/{cb_code}/fetch-conversion-price")
+async def auto_fetch_conversion_price(cb_code: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT stock_code FROM convertible_bonds WHERE cb_code=?", (cb_code,))
+        row = await cur.fetchone()
+        if not row:
+            raise HTTPException(404, "CB not found")
+        stock_code = row["stock_code"]
+
+    price = await fetch_conversion_price_mops(stock_code)
+    if price:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE convertible_bonds SET conversion_price=?, updated_at=datetime('now','localtime') WHERE cb_code=?",
+                (price, cb_code),
+            )
+            await db.commit()
+        return {"status": "ok", "conversion_price": price}
+    return {"status": "not_found", "message": "無法從MOPS取得，請手動輸入"}
+
+
+# ──────────────────────────────────────────────────────────
+# API: Stats & health
+# ──────────────────────────────────────────────────────────
+
+@app.get("/api/health")
+async def health():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM convertible_bonds WHERE is_active=1")
+        active = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT MAX(trade_date) FROM premium_history")
+        latest = (await cur.fetchone())[0]
+    return {"status": "ok", "active_cbs": active, "latest_data_date": latest,
+            "discovery": _discovery_status}
+
+
+@app.get("/api/stats")
+async def get_stats():
+    date = last_trading_date()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM convertible_bonds WHERE is_active=1")
+        total_cbs = (await cur.fetchone())[0]
+        cur = await db.execute(
+            "SELECT COUNT(*),AVG(premium_pct),MIN(premium_pct),MAX(premium_pct) FROM premium_history WHERE trade_date=?",
+            (date,),
+        )
+        row = await cur.fetchone()
+        count, avg_pct, min_pct, max_pct = row
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM premium_history WHERE trade_date=? AND premium_pct < 0", (date,)
+        )
+        discount_count = (await cur.fetchone())[0]
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM premium_history WHERE trade_date=? AND premium_pct >= 0", (date,)
+        )
+        premium_count = (await cur.fetchone())[0]
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM cb_prices WHERE trade_date=?", (date,)
+        )
+        price_count = (await cur.fetchone())[0]
+
+    return {
+        "trade_date": date,
+        "total_active_cbs": total_cbs,
+        "cbs_with_prices": price_count,
+        "cbs_with_premium": count,
+        "avg_premium_pct": round(avg_pct, 2) if avg_pct else None,
+        "min_premium_pct": round(min_pct, 2) if min_pct else None,
+        "max_premium_pct": round(max_pct, 2) if max_pct else None,
+        "discount_count": discount_count,
+        "premium_count": premium_count,
+        "discovery": _discovery_status,
+    }
+
+
+# ──────────────────────────────────────────────────────────
+# Serve frontend (must be last)
+# ──────────────────────────────────────────────────────────
+
+app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

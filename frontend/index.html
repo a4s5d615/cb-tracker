@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>可轉債折溢價追蹤器</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+
+<!-- ── TOP BAR ──────────────────────────────────────── -->
+<header class="bg-slate-900 border-b border-slate-700 px-4 py-3 flex items-center gap-4 flex-wrap sticky top-0 z-50">
+  <div class="flex items-center gap-2">
+    <span class="text-xl font-bold text-blue-400">⚡ CB追蹤器</span>
+    <span class="text-xs text-slate-400">可轉債折溢價分析</span>
+  </div>
+
+  <!-- Search -->
+  <div class="flex-1 min-w-48">
+    <input id="search-input" type="text" placeholder="搜尋 CB代號/名稱/股票..."
+      class="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-1.5 text-sm placeholder-slate-500 focus:outline-none focus:border-blue-500 transition" />
+  </div>
+
+  <!-- Filters -->
+  <div class="flex items-center gap-2 text-sm flex-wrap">
+    <select id="filter-market" class="bg-slate-800 border border-slate-600 rounded px-2 py-1.5 text-sm focus:outline-none focus:border-blue-500">
+      <option value="all">全部市場</option>
+      <option value="TWSE">上市(TWSE)</option>
+      <option value="TPEX">上櫃(TPEX)</option>
+    </select>
+
+    <select id="filter-premium" class="bg-slate-800 border border-slate-600 rounded px-2 py-1.5 text-sm focus:outline-none focus:border-blue-500">
+      <option value="all">全部折溢價</option>
+      <option value="below_par">低於面值 (&lt; 100)</option>
+      <option value="near_par">接近面值 (98-102)</option>
+      <option value="above_par">高於面值 (&gt; 100)</option>
+      <option value="deep_discount">深度折價 (&lt; -10%)</option>
+      <option value="discount">折價 (&lt; 0%)</option>
+      <option value="premium">溢價 (&gt; 0%)</option>
+      <option value="deep_premium">高溢價 (&gt; 20%)</option>
+      <option value="quality">⭐ 優質可轉債 (轉換價值&gt;80 且轉換溢價率&gt;10%)</option>
+    </select>
+
+    <button id="btn-scan" class="bg-green-700 hover:bg-green-600 text-white px-3 py-1.5 rounded text-sm font-medium transition flex items-center gap-1">
+      🔍 全市場掃描
+    </button>
+
+    <button id="btn-refresh" class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm font-medium transition flex items-center gap-1">
+      <span id="refresh-icon">↻</span> 更新今日報價
+    </button>
+
+    <button id="btn-sync-conv" class="bg-teal-700 hover:bg-teal-600 text-white px-3 py-1.5 rounded text-sm font-medium transition" title="從CBAS自動抓取所有可轉債的最新轉換價格">
+      ⟳ 同步轉換價
+    </button>
+
+    <button id="btn-bulk-conv" class="bg-amber-700 hover:bg-amber-600 text-white px-3 py-1.5 rounded text-sm font-medium transition" title="批量手動輸入各CB的轉換價格">
+      ✏ 設轉換價
+    </button>
+
+    <button id="btn-backfill" class="bg-purple-800 hover:bg-purple-700 text-white px-3 py-1.5 rounded text-sm font-medium transition" title="補充過去90天的歷史價格資料（從TPEX債券歷史資料抓取）">
+      📥 補歷史資料
+    </button>
+
+    <button id="btn-add-cb" class="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1.5 rounded text-sm font-medium transition">
+      + 新增CB
+    </button>
+
+    <span id="last-update" class="text-xs text-slate-400"></span>
+  </div>
+</header>
+
+<!-- ── SCAN PROGRESS BAR ──────────────────────────────── -->
+<div id="scan-banner" class="hidden bg-blue-900/50 border-b border-blue-700 px-4 py-2 flex items-center gap-3">
+  <div class="spin text-blue-400 text-lg">↻</div>
+  <div class="flex-1">
+    <div class="text-sm text-blue-200 font-medium" id="scan-msg">掃描全市場可轉債中...</div>
+    <div class="w-full bg-blue-900 rounded-full h-1.5 mt-1">
+      <div id="scan-bar" class="bg-blue-400 h-1.5 rounded-full transition-all duration-500" style="width:0%"></div>
+    </div>
+  </div>
+  <div class="text-xs text-blue-300" id="scan-pct">0%</div>
+</div>
+
+<!-- ── STATS BAR ─────────────────────────────────────── -->
+<div id="stats-bar" class="grid grid-cols-2 md:grid-cols-5 gap-px bg-slate-700 border-b border-slate-700">
+  <div class="bg-slate-900 px-4 py-3 text-center">
+    <div class="text-2xl font-bold text-white" id="stat-total">—</div>
+    <div class="text-xs text-slate-400">全市場CB數</div>
+  </div>
+  <div class="bg-slate-900 px-4 py-3 text-center">
+    <div class="text-2xl font-bold text-blue-400" id="stat-with-price">—</div>
+    <div class="text-xs text-slate-400">今日有報價</div>
+  </div>
+  <div class="bg-slate-900 px-4 py-3 text-center">
+    <div class="text-2xl font-bold text-green-400" id="stat-below-par">—</div>
+    <div class="text-xs text-slate-400">低於面值</div>
+  </div>
+  <div class="bg-slate-900 px-4 py-3 text-center">
+    <div class="text-2xl font-bold text-red-400" id="stat-above-par">—</div>
+    <div class="text-xs text-slate-400">高於面值</div>
+  </div>
+  <div class="bg-slate-900 px-4 py-3 text-center">
+    <div class="text-2xl font-bold text-yellow-400" id="stat-date">—</div>
+    <div class="text-xs text-slate-400">資料日期</div>
+  </div>
+</div>
+
+<!-- ── TABLE COUNT BAR ───────────────────────────────── -->
+<div class="px-4 py-1.5 bg-slate-900 border-b border-slate-800 flex items-center justify-between text-xs text-slate-500">
+  <span id="table-count"></span>
+  <span class="text-slate-600"><sup class="text-amber-600">?</sup> 表示未設轉換價，非真正轉換溢價率　｜　轉換溢價率 = (CB現價 − 轉換價值) ÷ 轉換價值 × 100%</span>
+</div>
+
+<!-- ── MAIN TABLE ────────────────────────────────────── -->
+<main class="overflow-x-auto">
+  <table class="w-full text-sm border-collapse">
+    <thead class="bg-slate-800 text-slate-300 sticky top-[57px] z-40">
+      <tr>
+        <th class="sortable px-3 py-2 text-left whitespace-nowrap cursor-pointer select-none" data-col="cb_code">CB代號 <span class="sort-icon">⇅</span></th>
+        <th class="px-3 py-2 text-left">CB名稱</th>
+        <th class="sortable px-3 py-2 text-left whitespace-nowrap cursor-pointer select-none" data-col="stock_code">股票 <span class="sort-icon">⇅</span></th>
+        <th class="sortable px-3 py-2 text-right whitespace-nowrap cursor-pointer select-none" data-col="cb_price">CB現價 <span class="sort-icon">⇅</span></th>
+        <th class="sortable px-3 py-2 text-right whitespace-nowrap cursor-pointer select-none" data-col="stock_price">股價 <span class="sort-icon">⇅</span></th>
+        <th class="sortable px-3 py-2 text-right whitespace-nowrap cursor-pointer select-none" data-col="conversion_price" title="轉換價：每股換股價格（點格子可快速設定）">轉換價 <span class="sort-icon">⇅</span></th>
+        <th class="sortable px-3 py-2 text-right whitespace-nowrap cursor-pointer select-none" data-col="parity" title="轉換價值 = 股價 × (100 / 轉換價)　代表可轉債若立即換股所得價值">轉換價值 <span class="sort-icon">⇅</span></th>
+        <th class="sortable px-3 py-2 text-right whitespace-nowrap cursor-pointer select-none" data-col="premium_pct" title="轉換溢價率 = (CB現價 − 轉換價值) / 轉換價值 × 100%&#10;溢價=CB比換股貴；折價=CB比換股便宜">轉換溢價率 <span class="sort-icon">⇅</span></th>
+        <th class="px-3 py-2 text-right whitespace-nowrap">CB漲跌%</th>
+        <th class="sortable px-3 py-2 text-right whitespace-nowrap cursor-pointer select-none" data-col="maturity_date">到期日 <span class="sort-icon">⇅</span></th>
+        <th class="px-3 py-2 text-right whitespace-nowrap">成交量</th>
+        <th class="px-3 py-2 text-center">操作</th>
+      </tr>
+    </thead>
+    <tbody id="cb-table-body">
+      <tr>
+        <td colspan="12" class="text-center py-16 text-slate-500">
+          <div class="text-4xl mb-2">📊</div>
+          <div>載入中...</div>
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</main>
+
+<!-- ── EMPTY STATE (no CBs in DB) ────────────────────── -->
+<div id="empty-state" class="hidden flex-col items-center justify-center py-24 text-slate-400">
+  <div class="text-6xl mb-4">📋</div>
+  <div class="text-xl mb-2">尚無追蹤中的可轉債</div>
+  <p class="text-sm mb-6">點擊「新增CB」手動新增，或使用「自動探索」從TWSE找出可轉債</p>
+  <div class="flex gap-3">
+    <button onclick="openAddModal()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded font-medium">+ 手動新增</button>
+    <button onclick="discoverCBs()" class="bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 rounded font-medium">🔍 自動探索</button>
+  </div>
+</div>
+
+<!-- ── DETAIL MODAL ──────────────────────────────────── -->
+<div id="detail-modal" class="hidden fixed inset-0 z-[100] bg-black/70 flex items-start justify-center overflow-y-auto py-8 px-4">
+  <div class="bg-slate-900 rounded-xl border border-slate-700 w-full max-w-5xl shadow-2xl">
+    <!-- Header -->
+    <div class="flex items-center justify-between px-6 py-4 border-b border-slate-700">
+      <div>
+        <h2 id="modal-title" class="text-xl font-bold text-white">CB 詳情</h2>
+        <p id="modal-subtitle" class="text-sm text-slate-400"></p>
+      </div>
+      <button onclick="closeDetailModal()" class="text-slate-400 hover:text-white text-2xl leading-none">×</button>
+    </div>
+
+    <!-- Info row -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-px bg-slate-700 border-b border-slate-700">
+      <div class="bg-slate-900 p-4">
+        <div class="text-xs text-slate-400 mb-1">CB現價</div>
+        <div id="modal-cb-price" class="text-2xl font-bold text-white">—</div>
+      </div>
+      <div class="bg-slate-900 p-4">
+        <div class="text-xs text-slate-400 mb-1">股價</div>
+        <div id="modal-stock-price" class="text-2xl font-bold text-white">—</div>
+      </div>
+      <div class="bg-slate-900 p-4">
+        <div class="text-xs text-slate-400 mb-1">平價</div>
+        <div id="modal-parity" class="text-2xl font-bold text-white">—</div>
+      </div>
+      <div class="bg-slate-900 p-4">
+        <div class="text-xs text-slate-400 mb-1">折溢價</div>
+        <div id="modal-premium" class="text-2xl font-bold">—</div>
+      </div>
+    </div>
+
+    <!-- Conversion price editor -->
+    <div class="px-6 py-3 bg-slate-800/50 border-b border-slate-700 flex items-center gap-3 flex-wrap">
+      <span class="text-sm text-slate-400">轉換價格:</span>
+      <input id="modal-conv-price-input" type="number" step="0.01" placeholder="例: 45.60"
+        class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-sm w-32 focus:outline-none focus:border-blue-500" />
+      <button id="modal-save-conv-price" class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded text-sm">儲存</button>
+      <button id="modal-fetch-conv-price" class="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1 rounded text-sm">自動抓取</button>
+      <span id="modal-conv-status" class="text-xs text-slate-400"></span>
+    </div>
+
+    <!-- Charts -->
+    <div class="p-6 grid grid-cols-1 md:grid-cols-2 gap-6">
+      <div>
+        <h3 class="text-sm font-semibold text-slate-300 mb-3">折溢價歷史</h3>
+        <div class="chart-container"><canvas id="chart-premium"></canvas></div>
+      </div>
+      <div>
+        <h3 class="text-sm font-semibold text-slate-300 mb-3">CB價 vs 平價走勢</h3>
+        <div class="chart-container"><canvas id="chart-price"></canvas></div>
+      </div>
+    </div>
+
+    <!-- History table -->
+    <div class="px-6 pb-6">
+      <h3 class="text-sm font-semibold text-slate-300 mb-3">歷史記錄</h3>
+      <div class="overflow-x-auto rounded-lg border border-slate-700">
+        <table class="w-full text-xs">
+          <thead class="bg-slate-800 text-slate-400">
+            <tr>
+              <th class="px-3 py-2 text-left">日期</th>
+              <th class="px-3 py-2 text-right">CB現價</th>
+              <th class="px-3 py-2 text-right">股價</th>
+              <th class="px-3 py-2 text-right">平價</th>
+              <th class="px-3 py-2 text-right">折溢價%</th>
+              <th class="px-3 py-2 text-right">成交量</th>
+            </tr>
+          </thead>
+          <tbody id="modal-history-body" class="divide-y divide-slate-800"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── ADD CB MODAL ──────────────────────────────────── -->
+<div id="add-modal" class="hidden fixed inset-0 z-[100] bg-black/70 flex items-center justify-center px-4">
+  <div class="bg-slate-900 rounded-xl border border-slate-700 w-full max-w-md shadow-2xl">
+    <div class="flex items-center justify-between px-6 py-4 border-b border-slate-700">
+      <h2 class="text-lg font-bold">新增可轉債</h2>
+      <button onclick="closeAddModal()" class="text-slate-400 hover:text-white text-2xl">×</button>
+    </div>
+    <div class="p-6 space-y-4">
+      <div>
+        <label class="block text-xs text-slate-400 mb-1">CB代號 <span class="text-red-400">*</span></label>
+        <input id="add-cb-code" type="text" placeholder="例: 12343" class="input-field w-full" />
+      </div>
+      <div>
+        <label class="block text-xs text-slate-400 mb-1">CB名稱 <span class="text-red-400">*</span></label>
+        <input id="add-cb-name" type="text" placeholder="例: ABC可轉三" class="input-field w-full" />
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">股票代號 <span class="text-red-400">*</span></label>
+          <input id="add-stock-code" type="text" placeholder="例: 1234" class="input-field w-full" />
+        </div>
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">股票名稱</label>
+          <input id="add-stock-name" type="text" placeholder="例: ABC公司" class="input-field w-full" />
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">市場</label>
+          <select id="add-market" class="input-field w-full">
+            <option value="TWSE">上市(TWSE)</option>
+            <option value="TPEX">上櫃(TPEX)</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">轉換價格</label>
+          <input id="add-conv-price" type="number" step="0.01" placeholder="例: 45.60" class="input-field w-full" />
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs text-slate-400 mb-1">備註</label>
+        <input id="add-notes" type="text" placeholder="選填" class="input-field w-full" />
+      </div>
+      <div id="add-error" class="text-red-400 text-sm hidden"></div>
+      <div class="flex gap-3 pt-2">
+        <button onclick="submitAddCB()" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white py-2 rounded font-medium">新增</button>
+        <button onclick="closeAddModal()" class="flex-1 bg-slate-700 hover:bg-slate-600 text-white py-2 rounded">取消</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── BULK CONVERSION PRICE MODAL ──────────────────────── -->
+<div id="bulk-modal" class="hidden fixed inset-0 z-[100] bg-black/70 flex items-start justify-center overflow-y-auto py-8 px-4">
+  <div class="bg-slate-900 rounded-xl border border-slate-700 w-full max-w-4xl shadow-2xl">
+    <div class="flex items-center justify-between px-6 py-4 border-b border-slate-700">
+      <div>
+        <h2 class="text-lg font-bold text-white">批量設定轉換價格</h2>
+        <p class="text-xs text-slate-400 mt-0.5">轉換價格 = 股票面值 ÷ 換股比例（通常在公開說明書或券商軟體中可查到）</p>
+      </div>
+      <button onclick="closeBulkConvModal()" class="text-slate-400 hover:text-white text-2xl leading-none">×</button>
+    </div>
+
+    <!-- Formula reminder -->
+    <div class="px-6 py-3 bg-blue-950/40 border-b border-blue-900/50 text-xs text-blue-300">
+      <span class="font-semibold">折溢價公式：</span>
+      平價 = 股價 × (100 ÷ 轉換價)　|　折溢價% = (CB現價 − 平價) ÷ 平價 × 100%
+      &nbsp;|&nbsp; 例：股價100、轉換價100 → 平價100；CB若為102 → 溢價 +2%
+    </div>
+
+    <!-- Search + summary -->
+    <div class="px-6 py-3 border-b border-slate-700 flex items-center gap-3 flex-wrap">
+      <input id="bulk-search" type="text" placeholder="搜尋 CB代號/名稱/股票..."
+        class="bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-sm w-56 focus:outline-none focus:border-blue-500"
+        oninput="renderBulkList()" />
+      <span id="bulk-summary" class="text-xs text-slate-400"></span>
+      <span class="text-xs text-amber-400 ml-auto">橘色行 = 尚未設定轉換價格</span>
+    </div>
+
+    <!-- CB List -->
+    <div class="overflow-y-auto" style="max-height:55vh">
+      <table class="w-full text-sm">
+        <thead class="bg-slate-800 text-slate-400 sticky top-0 z-10">
+          <tr>
+            <th class="px-3 py-2 text-left">CB代號</th>
+            <th class="px-3 py-2 text-left">CB名稱</th>
+            <th class="px-3 py-2 text-left">股票</th>
+            <th class="px-3 py-2 text-right">到期日</th>
+            <th class="px-3 py-2 text-right">轉換價格 (NT$)</th>
+          </tr>
+        </thead>
+        <tbody id="bulk-list" class="divide-y divide-slate-800/50"></tbody>
+      </table>
+    </div>
+
+    <div class="px-6 py-4 border-t border-slate-700 flex items-center justify-between gap-3">
+      <p class="text-xs text-slate-500">輸入後點「保存全部」，系統自動回補歷史折溢價資料</p>
+      <div class="flex gap-3">
+        <button onclick="closeBulkConvModal()" class="bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 rounded text-sm">取消</button>
+        <button id="bulk-save-btn" onclick="saveBulkConvPrices()" class="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2 rounded text-sm font-medium">保存全部</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="app.js?v=3"></script>
+</body>
+</html>
