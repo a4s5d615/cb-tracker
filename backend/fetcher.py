@@ -281,6 +281,175 @@ async def discover_cbs_from_isin() -> list[dict]:
     return cbs
 
 
+# ── CBAS full sync (works from overseas — no geo-restriction) ──
+
+async def _download_cbas_excel_wb():
+    """Download CBAS issued CB Excel and return openpyxl workbook."""
+    async with httpx.AsyncClient(headers=CBAS_HEADERS, timeout=30, follow_redirects=True) as client:
+        resp = await client.get(CBAS_ISSUED_URL)
+        resp.raise_for_status()
+    return openpyxl.load_workbook(io.BytesIO(resp.content), data_only=True)
+
+
+async def fetch_cbas_full_data() -> list[dict]:
+    """
+    Download CBAS Excel and return full CB data.
+    Column mapping (1-indexed):
+      Col 1  = CB代號       Col 2  = CB名稱
+      Col 4  = 到期日       Col 10 = 轉換價格
+      Col 11 = 股票代號     Col 12 = 股票參考價格
+      Col 14 = CB市價(可賣出價格)
+    """
+    try:
+        wb = await _download_cbas_excel_wb()
+    except Exception as e:
+        print(f"[CBAS full] Download failed: {e}")
+        return []
+
+    ws = wb.active
+    result = []
+    for row_idx in range(2, ws.max_row + 1):
+        cb_code = str(ws.cell(row_idx, 1).value or "").strip()
+        if not (len(cb_code) == 5 and cb_code.isdigit()):
+            continue
+        cb_name     = str(ws.cell(row_idx, 2).value  or "").strip()
+        maturity    = ws.cell(row_idx, 4).value
+        conv_price  = _float(ws.cell(row_idx, 10).value)
+        stock_code  = str(ws.cell(row_idx, 11).value or "").strip().lstrip("'")
+        stock_ref   = _float(ws.cell(row_idx, 12).value)
+        cb_price    = _float(ws.cell(row_idx, 14).value)
+
+        # Normalise maturity date → YYYY-MM-DD
+        maturity_str = None
+        if maturity:
+            s = str(maturity).replace("/", "-").strip()
+            if len(s) == 10:
+                maturity_str = s
+
+        result.append({
+            "cb_code":        cb_code,
+            "cb_name":        cb_name,
+            "stock_code":     stock_code,
+            "maturity_date":  maturity_str,
+            "conversion_price": conv_price,
+            "stock_ref_price":  stock_ref,
+            "cb_price":         cb_price,
+        })
+
+    print(f"[CBAS full] Parsed {len(result)} CBs from Excel")
+    return result
+
+
+async def sync_all_from_cbas(trade_date: Optional[str] = None) -> dict:
+    """
+    Full CB discovery + price sync using CBAS Excel as the only data source.
+    Works from overseas (no geo-restricted TWSE/ISIN APIs needed).
+
+    Steps:
+      1. CBAS Excel → CB list, CB prices, conversion prices
+      2. TWSE/TPEX OpenAPI → stock prices (public APIs, no geo-restriction)
+      3. Store everything; compute premium_history where possible.
+    """
+    trade_date = trade_date or last_trading_date()
+    print(f"[CBAS sync-all] Starting for {trade_date}")
+
+    cbas_rows = await fetch_cbas_full_data()
+    if not cbas_rows:
+        return {"status": "failed", "reason": "cbas_fetch_failed"}
+
+    # Parallel: stock prices from TWSE + TPEX (both are public APIs)
+    twse_stocks, tpex_stocks = await asyncio.gather(
+        fetch_twse_stocks_today(),
+        fetch_tpex_stocks_today(trade_date),
+    )
+    all_stocks = {**tpex_stocks, **twse_stocks}
+    print(f"[CBAS sync-all] {len(twse_stocks)} TWSE + {len(tpex_stocks)} TPEX stock prices")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Save all stock prices
+        for stock_code, sp in all_stocks.items():
+            await db.execute(
+                "INSERT OR REPLACE INTO stock_prices (stock_code, trade_date, close_price, source) VALUES (?,?,?,?)",
+                (stock_code, trade_date, sp["close"],
+                 "twse" if stock_code in twse_stocks else "tpex"),
+            )
+
+        # Resolve stock names from API data
+        stock_names = {
+            code: info.get("name", "") for code, info in {**tpex_stocks, **twse_stocks}.items()
+        }
+
+        cb_saved = premium_saved = 0
+        for item in cbas_rows:
+            cb_code    = item["cb_code"]
+            stock_code = item["stock_code"]
+            cb_price   = item["cb_price"]
+            conv_price = item["conversion_price"]
+            stock_name = stock_names.get(stock_code, "")
+            market     = "TWSE" if stock_code in twse_stocks else "TPEX"
+
+            # Upsert CB record
+            await db.execute(
+                """INSERT INTO convertible_bonds
+                     (cb_code, cb_name, stock_code, stock_name, stock_market,
+                      maturity_date, conversion_price, is_active)
+                   VALUES (?,?,?,?,?,?,?,1)
+                   ON CONFLICT(cb_code) DO UPDATE SET
+                     cb_name          = CASE WHEN cb_name='' THEN excluded.cb_name ELSE cb_name END,
+                     stock_code       = excluded.stock_code,
+                     stock_name       = CASE WHEN (stock_name IS NULL OR stock_name='')
+                                             THEN excluded.stock_name ELSE stock_name END,
+                     stock_market     = excluded.stock_market,
+                     maturity_date    = CASE WHEN maturity_date IS NULL
+                                             THEN excluded.maturity_date ELSE maturity_date END,
+                     conversion_price = excluded.conversion_price,
+                     is_active        = 1,
+                     updated_at       = datetime('now','localtime')""",
+                (cb_code, item["cb_name"], stock_code, stock_name, market,
+                 item.get("maturity_date"), conv_price),
+            )
+
+            # Save CB price
+            if cb_price and cb_price > 0:
+                await db.execute(
+                    "INSERT OR REPLACE INTO cb_prices (cb_code, trade_date, close_price, source) VALUES (?,?,?,?)",
+                    (cb_code, trade_date, cb_price, "cbas"),
+                )
+                cb_saved += 1
+
+                # Use API stock price first, fall back to CBAS reference price
+                stock_price = (all_stocks.get(stock_code) or {}).get("close") \
+                              or item.get("stock_ref_price")
+
+                if conv_price and conv_price > 0 and stock_price:
+                    parity = stock_price * (100.0 / conv_price)
+                    premium_pct = (cb_price - parity) / parity * 100.0
+                    await db.execute(
+                        """INSERT OR REPLACE INTO premium_history
+                           (cb_code, trade_date, cb_price, stock_price, conversion_price, parity, premium_pct)
+                           VALUES (?,?,?,?,?,?,?)""",
+                        (cb_code, trade_date, cb_price, stock_price, conv_price, parity, premium_pct),
+                    )
+                    premium_saved += 1
+
+        await db.commit()
+
+    result = {
+        "status":             "ok",
+        "trade_date":         trade_date,
+        "cbs_synced":         len(cbas_rows),
+        "cb_prices_saved":    cb_saved,
+        "premiums_calculated": premium_saved,
+        "twse_stocks":        len(twse_stocks),
+        "tpex_stocks":        len(tpex_stocks),
+    }
+    print(f"[CBAS sync-all] Done: {result}")
+    await log_fetch("cbas_sync_all", trade_date, "success", len(cbas_rows), str(result))
+    return result
+
+
 # ── Conversion prices from CBAS (cbas16889.pscnet.com.tw) ────
 
 async def fetch_conversion_prices_cbas() -> dict[str, float]:

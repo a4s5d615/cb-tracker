@@ -22,6 +22,7 @@ from backend.fetcher import (
     fetch_conversion_price_mops,
     last_trading_date, sync_cb_list_from_isin,
     sync_conversion_prices_from_cbas,
+    sync_all_from_cbas,
     fetch_historical_prices_for_date,
     backfill_history,
 )
@@ -44,8 +45,11 @@ _discovery_status = {"running": False, "progress": 0, "message": "idle", "last_r
 async def _scheduled_daily_fetch():
     """Called by APScheduler every weekday at 14:35 Taiwan time."""
     print("[Scheduler] Daily auto-fetch triggered")
-    await refresh_all_prices()
-    await sync_conversion_prices_from_cbas()
+    # sync_all_from_cbas handles CB list + CB prices + stock prices + premiums in one shot
+    result = await sync_all_from_cbas()
+    if result.get("status") != "ok":
+        # Fallback to ISIN-based discovery (works on local Taiwan IP)
+        await refresh_all_prices()
 
 
 @asynccontextmanager
@@ -64,25 +68,28 @@ async def lifespan(app: FastAPI):
 
 
 async def _auto_start_if_needed():
-    """On startup: run full discovery if we have no CB data at all."""
+    """On startup: use CBAS sync (works overseas) with ISIN as fallback."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT COUNT(*) FROM convertible_bonds WHERE is_active=1")
         count = (await cur.fetchone())[0]
+
     if count == 0:
-        print("[Startup] No CBs in DB — triggering full discovery automatically...")
-        await _run_discovery_bg()
+        print("[Startup] No CBs in DB — running CBAS full sync...")
+        result = await sync_all_from_cbas()
+        if result.get("status") != "ok" or result.get("cbs_synced", 0) == 0:
+            print("[Startup] CBAS failed, falling back to ISIN discovery...")
+            await _run_discovery_bg()
     else:
-        # Refresh prices for today if missing
         trade_date = last_trading_date()
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute("SELECT COUNT(*) FROM cb_prices WHERE trade_date=?", (trade_date,))
             price_count = (await cur.fetchone())[0]
         if price_count == 0:
-            print(f"[Startup] No prices for {trade_date} — refreshing...")
-            await refresh_all_prices(trade_date)
-        # Always sync conversion prices on startup
-        print("[Startup] Syncing conversion prices from CBAS...")
-        asyncio.create_task(sync_conversion_prices_from_cbas())
+            print(f"[Startup] No prices for {trade_date} — running CBAS sync...")
+            asyncio.create_task(sync_all_from_cbas(trade_date))
+        else:
+            print("[Startup] Prices up to date, syncing conversion prices...")
+            asyncio.create_task(sync_conversion_prices_from_cbas())
 
 
 async def _run_discovery_bg():
@@ -310,6 +317,13 @@ async def discovery_status():
 async def sync_cb_list():
     """Re-sync CB list from ISIN (add new, expire old). Fast operation."""
     result = await sync_cb_list_from_isin()
+    return result
+
+
+@app.post("/api/discover/sync-cbas")
+async def sync_cbas_full(trade_date: Optional[str] = Body(None, embed=True)):
+    """Full sync from CBAS Excel: CB list + prices + conversion prices. Works overseas."""
+    result = await sync_all_from_cbas(trade_date)
     return result
 
 
