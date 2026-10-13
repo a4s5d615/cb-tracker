@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import aiosqlite
+import httpx
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, HTTPException, Query, Body
@@ -110,6 +111,43 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown()
 
 
+CBAS_CACHE_URL = "https://raw.githubusercontent.com/a4s5d615/cb-tracker/master/data/cbas_cache.json"
+
+
+async def _load_cbas_cache_from_github():
+    """Render 啟動時從 GitHub raw 讀取轉換價 + 流通餘額快取，寫入 DB。"""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(CBAS_CACHE_URL)
+            if r.status_code != 200:
+                print(f"[CBAS Cache] GitHub raw 回應 {r.status_code}，略過")
+                return 0, 0
+            cache = r.json()
+
+        prices      = cache.get("prices", {})
+        outstanding = cache.get("outstanding", {})
+        updated_at  = cache.get("updated_at", "unknown")
+        print(f"[CBAS Cache] 讀到 {len(prices)} 筆轉換價 / {len(outstanding)} 筆流通餘額（更新時間：{updated_at}）")
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            for cb_code, price in prices.items():
+                await db.execute(
+                    "UPDATE convertible_bonds SET conversion_price=? WHERE cb_code=?",
+                    (float(price), cb_code),
+                )
+            for cb_code, vals in outstanding.items():
+                await db.execute(
+                    "UPDATE convertible_bonds SET outstanding_lots=?, outstanding_pct=? WHERE cb_code=?",
+                    (vals.get("lots"), vals.get("pct"), cb_code),
+                )
+            await db.commit()
+        print(f"[CBAS Cache] 已套用轉換價 {len(prices)} / 流通餘額 {len(outstanding)} 到 DB")
+        return len(prices), len(outstanding)
+    except Exception as e:
+        print(f"[CBAS Cache] 載入失敗：{e}")
+        return 0, 0
+
+
 async def _auto_start_if_needed():
     """On startup: use CBAS sync (works overseas) with ISIN as fallback."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -122,6 +160,8 @@ async def _auto_start_if_needed():
         if result.get("status") != "ok" or result.get("cbs_synced", 0) == 0:
             print("[Startup] CBAS failed, falling back to ISIN discovery...")
             await _run_discovery_bg()
+        # 不管 CBAS 成不成功，都嘗試從 GitHub cache 補轉換價
+        asyncio.create_task(_load_cbas_cache_from_github())
     else:
         trade_date = last_trading_date()
         async with aiosqlite.connect(DB_PATH) as db:
@@ -133,6 +173,8 @@ async def _auto_start_if_needed():
         else:
             print("[Startup] Prices up to date, syncing conversion prices...")
             asyncio.create_task(sync_conversion_prices_from_cbas())
+        # 每次啟動都從 GitHub cache 補轉換價 + 流通餘額
+        asyncio.create_task(_load_cbas_cache_from_github())
 
 
 async def _run_discovery_bg():
