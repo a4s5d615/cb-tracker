@@ -142,6 +142,12 @@ async def _load_cbas_cache_from_github():
                 )
             await db.commit()
         print(f"[CBAS Cache] 已套用轉換價 {len(prices)} / 流通餘額 {len(outstanding)} 到 DB")
+
+        # 重新計算溢折價（backfill premium_history）
+        backfilled = 0
+        for cb_code, price in prices.items():
+            backfilled += await _backfill_premium(cb_code, float(price))
+        print(f"[CBAS Cache] 溢折價重算完成，{backfilled} 筆歷史記錄已更新")
         return len(prices), len(outstanding)
     except Exception as e:
         print(f"[CBAS Cache] 載入失敗：{e}")
