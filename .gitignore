@@ -9,6 +9,7 @@ env/
 
 # Database (don't commit local DB — Railway uses a volume)
 data/
+!data/cbas_cache.json
 *.db
 *.sqlite
 
