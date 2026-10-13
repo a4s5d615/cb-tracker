@@ -188,6 +188,8 @@ class CBUpdate(BaseModel):
     conversion_price: Optional[float] = None
     is_active: Optional[int] = None
     notes: Optional[str] = None
+    outstanding_lots: Optional[int] = None
+    outstanding_pct: Optional[float] = None
 
 
 def row_to_dict(row) -> dict:
@@ -328,6 +330,26 @@ async def bulk_set_conversion_prices(body: BulkConversionPrice):
         except Exception as e:
             results[cb_code] = {"error": str(e)}
     return {"status": "ok", "results": results}
+
+
+@app.post("/api/cbs/bulk-outstanding")
+async def bulk_set_outstanding(body: dict):
+    """批次更新流通餘額(張數)與餘額比例。body: {cb_code: {lots, pct}}"""
+    items = body.get("items", {})
+    updated = 0
+    async with aiosqlite.connect(DB_PATH) as db:
+        for cb_code, vals in items.items():
+            lots = vals.get("lots")
+            pct  = vals.get("pct")
+            if lots is None and pct is None:
+                continue
+            await db.execute(
+                "UPDATE convertible_bonds SET outstanding_lots=?, outstanding_pct=?, updated_at=datetime('now','localtime') WHERE cb_code=?",
+                (lots, pct, cb_code),
+            )
+            updated += 1
+        await db.commit()
+    return {"status": "ok", "updated": updated}
 
 
 @app.delete("/api/cbs/{cb_code}")
