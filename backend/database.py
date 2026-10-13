@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS convertible_bonds (
     face_value       REAL DEFAULT 100.0,
     maturity_date    TEXT,
     issue_size       REAL,
+    outstanding_lots INTEGER,
+    outstanding_pct  REAL,
     is_active        INTEGER DEFAULT 1,
     notes            TEXT,
     created_at       TEXT DEFAULT (datetime('now','localtime')),
@@ -85,6 +87,15 @@ async def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
+        # Migrations: add columns that may not exist in older DBs
+        for col, definition in [
+            ("outstanding_lots", "INTEGER"),
+            ("outstanding_pct",  "REAL"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE convertible_bonds ADD COLUMN {col} {definition}")
+            except Exception:
+                pass  # Column already exists
         await db.commit()
 
 

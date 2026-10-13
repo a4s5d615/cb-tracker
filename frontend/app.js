@@ -5,6 +5,7 @@
 
 const API = '/api';
 let allRows       = [];      // full premium/today response
+let overboughtMap = {};      // cb_code → analysis result (loaded on demand)
 let sortCol       = 'cb_price';
 let sortAsc       = false;   // descending by default for price
 let charts        = {};      // active Chart.js instances
@@ -60,6 +61,32 @@ function daysToMaturity(maturityDate) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   return Math.round((d - today) / (1000 * 60 * 60 * 24));
+}
+
+// ── Conversion progress cell ─────────────────────────────────
+
+function convProgressCell(r) {
+  const pct = r.outstanding_pct;   // 0-100, percentage of bonds still outstanding
+  const lots = r.outstanding_lots; // integer, remaining lots
+  if (pct == null) return '<span class="text-slate-600 text-xs">—</span>';
+
+  const converted = 100 - pct;  // how much has been converted
+  const lotsStr = lots != null ? lots.toLocaleString() + '張' : '';
+
+  let colorClass, label;
+  if (converted < 1) {
+    colorClass = 'text-slate-500'; label = '未轉換';
+  } else if (converted < 30) {
+    colorClass = 'text-blue-400'; label = `已轉 ${converted.toFixed(1)}%`;
+  } else if (converted < 70) {
+    colorClass = 'text-amber-400'; label = `已轉 ${converted.toFixed(1)}%`;
+  } else {
+    colorClass = 'text-red-400'; label = `已轉 ${converted.toFixed(1)}%`;
+  }
+
+  return `<span class="font-mono text-xs ${colorClass}" title="流通餘額: ${lotsStr}&#10;已轉換: ${converted.toFixed(1)}%&#10;餘額比例: ${pct.toFixed(1)}%">
+    ${label}<br><span class="text-slate-500">${lotsStr}</span>
+  </span>`;
 }
 
 // ── Premium/par colour logic ─────────────────────────────────
@@ -126,6 +153,16 @@ function applyFilters(rows) {
       case 'premium':    if (p === null || p <  0) return false; break;
       case 'deep_premium': if (p === null || p <= 20) return false; break;
       case 'quality': if (p === null || p <= 10 || r.parity === null || r.parity <= 80) return false; break;
+      case 'elite': {
+        const converted = r.outstanding_pct != null ? (100 - r.outstanding_pct) : null;
+        if (p === null || p <= 15) return false;
+        if (r.parity === null || r.parity <= 85) return false;
+        if (converted === null || converted >= 50) return false;
+        break;
+      }
+      case 'overbought':
+        if (!overboughtMap[r.cb_code]) return false;
+        break;
     }
     return true;
   });
@@ -223,9 +260,18 @@ function renderTable() {
       : `<button onclick="event.stopPropagation();quickSetConvPrice('${r.cb_code}',this)"
            class="text-xs text-amber-400 hover:text-amber-200 border border-amber-700/40 rounded px-1.5 py-0.5">設定</button>`;
 
+    // 異常偏高標記
+    const ob = overboughtMap[r.cb_code];
+    const obBadge = ob
+      ? `<span class="ml-1 text-[10px] bg-red-900 text-red-300 rounded px-1 py-0.5 align-middle"
+             title="CB超漲 +${ob.cb_excess_pct}%&#10;股距高點 ${ob.stock_vs_high_pct}%&#10;股高日:${ob.stock_high_date}&#10;股高日CB價:${ob.cb_at_stock_high}">⚠CB偏高</span>`
+      : '';
+
     return `<tr class="hover:bg-slate-800/30 cursor-pointer border-b border-slate-800/50 ${rCls}" onclick="openDetailModal('${r.cb_code}')">
-      <td class="px-3 py-2 font-mono text-blue-300 text-sm">${r.cb_code}</td>
-      <td class="px-3 py-2 max-w-[140px] truncate text-sm" title="${r.cb_name||''}">${r.cb_name || '—'}</td>
+      <td class="px-3 py-2 font-mono text-blue-300 text-sm cursor-pointer hover:text-blue-100 hover:underline"
+          onclick="event.stopPropagation();openKlineModal('${r.cb_code}')"
+          title="點擊查看K線圖">${r.cb_code}</td>
+      <td class="px-3 py-2 max-w-[160px] truncate text-sm" title="${r.cb_name||''}">${r.cb_name || '—'}${obBadge}</td>
       <td class="px-3 py-2 text-sm">
         <span class="font-mono">${r.stock_code}</span>
         <span class="text-slate-400 text-xs ml-1">${r.stock_name || ''}</span>
@@ -233,6 +279,7 @@ function renderTable() {
       <td class="px-3 py-2 text-right font-mono text-sm">${fmtNum(r.cb_price)}</td>
       <td class="px-3 py-2 text-right font-mono text-sm text-slate-300">${fmtNum(r.stock_price)}</td>
       <td class="px-3 py-2 text-right">${convCell}</td>
+      <td class="px-3 py-2 text-right">${convProgressCell(r)}</td>
       <td class="px-3 py-2 text-right">${parityCell}</td>
       <td class="px-3 py-2 text-right">${premiumCell}</td>
       <td class="px-3 py-2 text-right text-xs">${fmtChg(r.cb_change_pct)}</td>
@@ -664,6 +711,33 @@ async function syncConversionPrices() {
 
 // ── Historical backfill ──────────────────────────────────────
 
+function showToast(msg, color = 'bg-slate-700') {
+  const el = document.createElement('div');
+  el.className = `fixed bottom-4 right-4 ${color} text-white text-sm px-4 py-2 rounded-lg shadow-xl z-[999]`;
+  el.id = 'toast-notif';
+  el.textContent = msg;
+  document.getElementById('toast-notif')?.remove();
+  document.body.appendChild(el);
+  return el;
+}
+
+async function loadOverboughtData() {
+  if (Object.keys(overboughtMap).length > 0) return; // already loaded
+  const toast = showToast('🔍 60天歷史分析中，請稍候…', 'bg-blue-800');
+  try {
+    const res = await get('/analysis/cb-overbought?days=60');
+    overboughtMap = {};
+    (res.data || []).forEach(r => { overboughtMap[r.cb_code] = r; });
+    toast.remove();
+    showToast(`✅ 找到 ${res.count} 筆 CB 異常偏高`, 'bg-green-800');
+    setTimeout(() => document.getElementById('toast-notif')?.remove(), 4000);
+  } catch(e) {
+    toast.remove();
+    showToast('❌ 分析失敗: ' + e.message, 'bg-red-800');
+    setTimeout(() => document.getElementById('toast-notif')?.remove(), 4000);
+  }
+}
+
 async function backfillHistory() {
   const btn = document.getElementById('btn-backfill');
   if (!confirm(
@@ -868,6 +942,128 @@ async function submitAddCB() {
   }
 }
 
+// ── K-Line Modal ─────────────────────────────────────────────
+
+let klineCbChart    = null;
+let klineStockChart = null;
+let klineCurrentCb  = null;
+let klineDays       = 60;
+
+async function openKlineModal(cbCode) {
+  klineCurrentCb = cbCode;
+  document.getElementById('kline-modal').classList.remove('hidden');
+  document.getElementById('kline-loading').classList.remove('hidden');
+  document.getElementById('kline-title').textContent = cbCode;
+  document.getElementById('kline-subtitle').textContent = '';
+  await loadKlineData(cbCode, klineDays);
+}
+
+function closeKlineModal() {
+  document.getElementById('kline-modal').classList.add('hidden');
+  if (klineCbChart)    { klineCbChart.remove();   klineCbChart    = null; }
+  if (klineStockChart) { klineStockChart.remove(); klineStockChart = null; }
+}
+
+async function loadKlineData(cbCode, days) {
+  document.getElementById('kline-loading').classList.remove('hidden');
+  try {
+    const data = await get(`/cbs/${cbCode}/kline-data?days=${days}`);
+    const cb   = data.cb;
+
+    document.getElementById('kline-title').textContent =
+      `${cb.cb_code}　${cb.cb_name}`;
+    document.getElementById('kline-subtitle').textContent =
+      `標的股票：${cb.stock_code} ${cb.stock_name || ''}`;
+    document.getElementById('kline-cb-label').textContent =
+      `${cb.cb_code} ${cb.cb_name} — CB收盤價`;
+    document.getElementById('kline-stock-label').textContent =
+      `${cb.stock_code} ${cb.stock_name || ''} — 股票K線`;
+
+    // Destroy old charts
+    if (klineCbChart)    { klineCbChart.remove();   klineCbChart    = null; }
+    if (klineStockChart) { klineStockChart.remove(); klineStockChart = null; }
+
+    const chartOpts = {
+      layout: { background: { color: '#0f172a' }, textColor: '#94a3b8' },
+      grid:   { vertLines: { color: '#1e293b' }, horzLines: { color: '#1e293b' } },
+      crosshair: { mode: 1 },
+      timeScale: { borderColor: '#334155', timeVisible: true, rightOffset: 5 },
+      rightPriceScale: { borderColor: '#334155' },
+      handleScroll: true,
+      handleScale: true,
+    };
+
+    // 上圖：CB 收盤價折線
+    const cbEl = document.getElementById('kline-cb-chart');
+    cbEl.innerHTML = '';
+    klineCbChart = LightweightCharts.createChart(cbEl, { ...chartOpts, width: cbEl.clientWidth, height: cbEl.clientHeight });
+    const cbSeries = klineCbChart.addLineSeries({ color: '#60a5fa', lineWidth: 2 });
+    if (data.cb_prices.length) {
+      cbSeries.setData(data.cb_prices.map(d => ({ time: d.date, value: d.value })));
+    }
+
+    // 下圖：股票 K 線
+    const stEl = document.getElementById('kline-stock-chart');
+    stEl.innerHTML = '';
+    klineStockChart = LightweightCharts.createChart(stEl, { ...chartOpts, width: stEl.clientWidth, height: stEl.clientHeight });
+    const candleSeries = klineStockChart.addCandlestickSeries({
+      upColor: '#22c55e', downColor: '#ef4444',
+      borderUpColor: '#22c55e', borderDownColor: '#ef4444',
+      wickUpColor: '#22c55e', wickDownColor: '#ef4444',
+    });
+    if (data.stock_ohlc.length) {
+      // 只顯示 CB 有資料的那段時間
+      const cbFirst = data.cb_prices[0]?.date ?? '0000-00-00';
+      const cbLast  = data.cb_prices[data.cb_prices.length - 1]?.date ?? '9999-99-99';
+      const ohlcFiltered = data.stock_ohlc.filter(d => d.date >= cbFirst && d.date <= cbLast);
+      candleSeries.setData(ohlcFiltered.map(d => ({
+        time: d.date, open: d.open, high: d.high, low: d.low, close: d.close,
+      })));
+    }
+
+    // 以股票日期範圍為準，兩圖對齊相同時間軸
+    // 股票資料最完整，先 fit；CB 圖也套用相同 visible range
+    klineStockChart.timeScale().fitContent();
+    klineCbChart.timeScale().fitContent();
+    // 稍等 layout 完成再同步，確保兩圖顯示完全相同的時間段
+    setTimeout(() => {
+      const stockRange = klineStockChart.timeScale().getVisibleLogicalRange();
+      const cbRange    = klineCbChart.timeScale().getVisibleLogicalRange();
+      // 取兩者中較寬的範圍（涵蓋所有資料）
+      if (stockRange && cbRange) {
+        const merged = {
+          from: Math.min(stockRange.from, cbRange.from),
+          to:   Math.max(stockRange.to,   cbRange.to),
+        };
+        klineCbChart.timeScale().setVisibleLogicalRange(merged);
+        klineStockChart.timeScale().setVisibleLogicalRange(merged);
+      } else if (stockRange) {
+        klineCbChart.timeScale().setVisibleLogicalRange(stockRange);
+      }
+    }, 80);
+
+    // 互相同步 zoom/pan
+    let syncing = false;
+    klineCbChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+      if (syncing || !range) return;
+      syncing = true;
+      klineStockChart.timeScale().setVisibleLogicalRange(range);
+      syncing = false;
+    });
+    klineStockChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+      if (syncing || !range) return;
+      syncing = true;
+      klineCbChart.timeScale().setVisibleLogicalRange(range);
+      syncing = false;
+    });
+
+  } catch(e) {
+    document.getElementById('kline-title').textContent = '載入失敗: ' + e.message;
+  } finally {
+    document.getElementById('kline-loading').classList.add('hidden');
+  }
+}
+
 // ── Event listeners ──────────────────────────────────────────
 
 function debounce(fn, ms) {
@@ -875,10 +1071,41 @@ function debounce(fn, ms) {
   return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
 }
 
+function resizeTableWrap() {
+  const wrap = document.getElementById('table-wrap');
+  if (!wrap) return;
+  const top = wrap.getBoundingClientRect().top;
+  wrap.style.height = (window.innerHeight - top) + 'px';
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
+  resizeTableWrap();
+  window.addEventListener('resize', resizeTableWrap);
+
+  // K-line day buttons
+  document.querySelectorAll('.kline-days-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      document.querySelectorAll('.kline-days-btn').forEach(b => {
+        b.className = 'kline-days-btn text-xs px-2 py-1 rounded bg-slate-700 text-slate-300';
+      });
+      btn.className = 'kline-days-btn text-xs px-2 py-1 rounded bg-blue-700 text-white';
+      klineDays = parseInt(btn.dataset.days);
+      if (klineCurrentCb) await loadKlineData(klineCurrentCb, klineDays);
+    });
+  });
+
+  // Escape to close K-line modal
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closeKlineModal();
+  });
   document.getElementById('search-input').addEventListener('input',  debounce(renderTable, 250));
   document.getElementById('filter-market').addEventListener('change', renderTable);
-  document.getElementById('filter-premium').addEventListener('change', renderTable);
+  document.getElementById('filter-premium').addEventListener('change', async () => {
+    if (document.getElementById('filter-premium').value === 'overbought') {
+      await loadOverboughtData();
+    }
+    renderTable();
+  });
 
   document.querySelectorAll('th.sortable').forEach(th => {
     th.addEventListener('click', () => {

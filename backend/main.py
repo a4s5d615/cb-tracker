@@ -18,13 +18,14 @@ from pydantic import BaseModel
 from backend.config import DB_PATH, FRONTEND_DIR
 from backend.database import init_db, log_fetch
 from backend.fetcher import (
-    refresh_all_prices, run_full_discovery,
+    refresh_all_prices, run_full_discovery, refresh_known_cbs,
     fetch_conversion_price_mops,
     last_trading_date, sync_cb_list_from_isin,
     sync_conversion_prices_from_cbas,
     sync_all_from_cbas,
     fetch_historical_prices_for_date,
     backfill_history,
+    fetch_stock_ohlc,
 )
 
 TW_TZ = pytz.timezone("Asia/Taipei")
@@ -42,23 +43,65 @@ _discovery_status = {"running": False, "progress": 0, "message": "idle", "last_r
 # Lifespan
 # ──────────────────────────────────────────────────────────
 
+async def _fetch_cb_prices_close():
+    """
+    13:35 job: fetch CB close prices from MIS while z-field is still populated.
+    Stores cb_prices only — stock prices and premiums updated later at 15:30.
+    """
+    print("[Scheduler 13:35] Fetching CB close prices from MIS...")
+    trade_date = last_trading_date()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT cb_code, stock_code, conversion_price FROM convertible_bonds WHERE is_active=1"
+        )
+        cb_meta = {r["cb_code"]: dict(r) for r in await cur.fetchall()}
+
+    from backend.fetcher import fetch_cb_prices_mis
+    cb_prices = await fetch_cb_prices_mis(list(cb_meta.keys()))
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        saved = 0
+        for cb_code, p in cb_prices.items():
+            cb_price = p.get("close")
+            if cb_price:
+                await db.execute(
+                    """INSERT OR REPLACE INTO cb_prices
+                       (cb_code, trade_date, open_price, high_price, low_price,
+                        close_price, prev_close, volume, source)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (cb_code, trade_date, p.get("open"), p.get("high"), p.get("low"),
+                     cb_price, p.get("prev_close"), p.get("volume", 0), "mis_close"),
+                )
+                saved += 1
+        await db.commit()
+    print(f"[Scheduler 13:35] Saved {saved} CB close prices for {trade_date}")
+
+
 async def _scheduled_daily_fetch():
-    """Called by APScheduler every weekday at 14:35 Taiwan time."""
-    print("[Scheduler] Daily auto-fetch triggered")
-    # sync_all_from_cbas handles CB list + CB prices + stock prices + premiums in one shot
+    """
+    15:30 job: CBAS sync (CB list + metadata + stock prices) then recalculate premiums.
+    CB prices already stored at 13:35 — do NOT overwrite with stale MIS data.
+    """
+    print("[Scheduler 15:30] Daily stock price + metadata sync triggered")
     result = await sync_all_from_cbas()
     if result.get("status") != "ok":
-        # Fallback to ISIN-based discovery (works on local Taiwan IP)
         await refresh_all_prices()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    # Daily auto-fetch: weekdays at 14:35 (after TWSE/TPEX close at 13:30)
+    # 13:35 — fetch CB close prices from MIS while z-field still populated
+    scheduler.add_job(
+        _fetch_cb_prices_close, "cron",
+        day_of_week="mon-fri", hour=13, minute=35,
+        id="cb_close_fetch", replace_existing=True,
+    )
+    # 15:30 — CBAS metadata + stock prices (TWSE API updates by now)
     scheduler.add_job(
         _scheduled_daily_fetch, "cron",
-        day_of_week="mon-fri", hour=14, minute=35,
+        day_of_week="mon-fri", hour=15, minute=30,
         id="daily_fetch", replace_existing=True,
     )
     scheduler.start()
@@ -322,7 +365,10 @@ async def sync_cb_list():
 
 @app.post("/api/discover/sync-cbas")
 async def sync_cbas_full(trade_date: Optional[str] = Body(None, embed=True)):
-    """Full sync from CBAS Excel: CB list + prices + conversion prices. Works overseas."""
+    """
+    Full sync from CBAS Excel: CB list + metadata + stock prices.
+    CB prices use INSERT OR IGNORE — preserves any MIS close prices from 13:35 job.
+    """
     result = await sync_all_from_cbas(trade_date)
     return result
 
@@ -402,7 +448,7 @@ async def get_today_premium(
                    ph.cb_price, ph.stock_price, ph.conversion_price,
                    ph.parity, ph.premium_pct, ph.trade_date,
                    cbp.prev_close AS cb_prev_close, cbp.volume AS cb_volume,
-                   cb.maturity_date
+                   cb.maturity_date, cb.outstanding_lots, cb.outstanding_pct
             FROM premium_history ph
             JOIN convertible_bonds cb ON ph.cb_code=cb.cb_code
             LEFT JOIN cb_prices cbp ON cbp.cb_code=ph.cb_code AND cbp.trade_date=ph.trade_date
@@ -426,7 +472,7 @@ async def get_today_premium(
                        cbp.close_price AS cb_price, sp.close_price AS stock_price,
                        cb.conversion_price, NULL AS parity, NULL AS premium_pct, cbp.trade_date,
                        cbp.prev_close AS cb_prev_close, cbp.volume AS cb_volume,
-                       cb.maturity_date
+                       cb.maturity_date, cb.outstanding_lots, cb.outstanding_pct
                 FROM cb_prices cbp
                 JOIN convertible_bonds cb ON cbp.cb_code=cb.cb_code
                 LEFT JOIN stock_prices sp ON sp.stock_code=cb.stock_code AND sp.trade_date=cbp.trade_date
@@ -452,6 +498,126 @@ async def get_today_premium(
 
     result = [add_computed(r) for r in rows_with] + [add_computed(r) for r in rows_without]
     return {"date": date, "total": len(result), "with_premium": len(rows_with), "data": result}
+
+
+@app.get("/api/analysis/cb-overbought")
+async def cb_overbought_analysis(days: int = 60):
+    """
+    找出「股價未創新高，但 CB 價格卻偏高」的異常情況。
+    邏輯：
+      1. 找過去 N 天中股價最高的那天（股高日）
+      2. 取那天的 CB 價格（股高CB價）
+      3. 若今日 CB > 股高CB 且 今日股價 < 股高股價 → 異常
+    回傳：cb_excess_pct（CB超漲幅）、stock_vs_high_pct（股價距高點）
+    """
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        # 所有 CB 最新一天的完整資料
+        cur = await db.execute("""
+            SELECT ph.cb_code, ph.cb_price AS today_cb, ph.stock_price AS today_stock,
+                   ph.parity, ph.premium_pct, ph.trade_date,
+                   cb.cb_name, cb.stock_code, cb.stock_name, cb.stock_market,
+                   cb.conversion_price, cb.maturity_date, cb.outstanding_lots, cb.outstanding_pct
+            FROM premium_history ph
+            JOIN convertible_bonds cb ON ph.cb_code = cb.cb_code
+            WHERE ph.trade_date = (SELECT MAX(trade_date) FROM premium_history WHERE cb_code = ph.cb_code)
+              AND cb.is_active = 1
+        """)
+        latest_map = {r["cb_code"]: dict(r) for r in await cur.fetchall()}
+
+        # 過去 N 天的所有歷史紀錄
+        cur = await db.execute("""
+            SELECT cb_code, trade_date, cb_price, stock_price
+            FROM premium_history
+            WHERE trade_date >= ?
+            ORDER BY cb_code, trade_date
+        """, (cutoff,))
+        all_history = await cur.fetchall()
+
+    # 按 CB 分組
+    from collections import defaultdict
+    history_by_cb: dict = defaultdict(list)
+    for row in all_history:
+        history_by_cb[row["cb_code"]].append(dict(row))
+
+    results = []
+    for cb_code, rows in history_by_cb.items():
+        if len(rows) < 3:
+            continue
+        latest = latest_map.get(cb_code)
+        if not latest:
+            continue
+
+        today_stock = latest["today_stock"]
+        today_cb    = latest["today_cb"]
+        today_date  = latest["trade_date"]
+
+        # 排除今天，在歷史資料中找股價最高那天
+        hist_rows = [r for r in rows if r["trade_date"] != today_date]
+        if not hist_rows:
+            continue
+
+        stock_high_row   = max(hist_rows, key=lambda x: x["stock_price"] or 0)
+        stock_60d_high   = stock_high_row["stock_price"]
+        cb_at_stock_high = stock_high_row["cb_price"]
+        stock_high_date  = stock_high_row["trade_date"]
+
+        if not all([stock_60d_high, cb_at_stock_high, today_stock, today_cb,
+                    stock_60d_high > 0, cb_at_stock_high > 0]):
+            continue
+
+        # 今日股價距 60 日高點的幅度（負 = 低於高點）
+        stock_vs_high_pct = (today_stock / stock_60d_high - 1) * 100
+        # 今日 CB 相對「股高日 CB 價」的超漲幅度（正 = CB 反而更貴）
+        cb_excess_pct = (today_cb / cb_at_stock_high - 1) * 100
+
+        # 條件：股價已從高點回落，但 CB 仍高於股高日 CB 價
+        min_stock_drop = -3 if len(rows) >= 20 else -1  # 資料少時放寬條件
+        if stock_vs_high_pct < min_stock_drop and cb_excess_pct > 0:
+            r = dict(latest)
+            r["cb_price"]         = today_cb
+            r["stock_price"]      = today_stock
+            r["stock_60d_high"]   = round(stock_60d_high, 2)
+            r["cb_at_stock_high"] = round(cb_at_stock_high, 2)
+            r["stock_high_date"]  = stock_high_date
+            r["stock_vs_high_pct"] = round(stock_vs_high_pct, 2)
+            r["cb_excess_pct"]    = round(cb_excess_pct, 2)
+            r["divergence"]       = round(cb_excess_pct - stock_vs_high_pct, 2)
+            results.append(r)
+
+    results.sort(key=lambda x: x["divergence"], reverse=True)
+    return {"days": days, "count": len(results), "data": results}
+
+
+@app.get("/api/cbs/{cb_code}/kline-data")
+async def get_kline_data(cb_code: str, days: int = 120):
+    """CB close price + stock OHLC for K-line comparison chart."""
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cur = await db.execute(
+            "SELECT cb_code, cb_name, stock_code, stock_name, stock_market FROM convertible_bonds WHERE cb_code=?",
+            (cb_code,)
+        )
+        cb = await cur.fetchone()
+        if not cb:
+            raise HTTPException(status_code=404, detail="CB not found")
+        cb = dict(cb)
+
+        cur = await db.execute(
+            "SELECT trade_date, close_price FROM cb_prices WHERE cb_code=? AND trade_date>=? ORDER BY trade_date ASC",
+            (cb_code, cutoff)
+        )
+        cb_prices = [{"date": r["trade_date"], "value": r["close_price"]} for r in await cur.fetchall()]
+
+    stock_ohlc = await fetch_stock_ohlc(cb["stock_code"], cb["stock_market"], days)
+
+    return {"cb": cb, "cb_prices": cb_prices, "stock_ohlc": stock_ohlc}
 
 
 @app.get("/api/premium/{cb_code}/history")

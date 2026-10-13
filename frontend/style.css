@@ -70,6 +70,39 @@ tr.row-deep-premium  { background: #1f0000; }
 .spin { animation: spin 1s linear infinite; display: inline-block; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ── Sticky columns (CB代號 + CB名稱) ── */
+.col-sticky-1,
+.col-sticky-2 {
+  position: sticky;
+  z-index: 10;
+}
+.col-sticky-1 { left: 0; }
+.col-sticky-2 { left: 74px; box-shadow: 3px 0 6px -2px rgba(0,0,0,0.6); }
+
+/* Header sticky cells sit above body sticky cells */
+thead .col-sticky-1,
+thead .col-sticky-2 { z-index: 30; background: #1e293b; }
+
+/* Body sticky cells: match default row bg */
+#cb-table-body .col-sticky-1,
+#cb-table-body .col-sticky-2 { background: #0f172a; }
+
+/* Sync sticky cell bg with row-level colour classes */
+#cb-table-body tr.row-deep-discount .col-sticky-1,
+#cb-table-body tr.row-deep-discount .col-sticky-2 { background: #0a1f0a; }
+#cb-table-body tr.row-discount      .col-sticky-1,
+#cb-table-body tr.row-discount      .col-sticky-2 { background: #0d1f0d; }
+#cb-table-body tr.row-slight-prem   .col-sticky-1,
+#cb-table-body tr.row-slight-prem   .col-sticky-2 { background: #1f1500; }
+#cb-table-body tr.row-premium       .col-sticky-1,
+#cb-table-body tr.row-premium       .col-sticky-2 { background: #1f0a00; }
+#cb-table-body tr.row-deep-premium  .col-sticky-1,
+#cb-table-body tr.row-deep-premium  .col-sticky-2 { background: #1f0000; }
+
+/* Hover: keep sticky cells in sync */
+#cb-table-body tr:hover .col-sticky-1,
+#cb-table-body tr:hover .col-sticky-2 { background: #1e293b; }
+
 /* Scrollbar */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: #0f172a; }

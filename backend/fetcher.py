@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import httpx
+import pytz
 from bs4 import BeautifulSoup
 import aiosqlite
 
@@ -50,7 +51,18 @@ def _float(val, default=None) -> Optional[float]:
 
 
 def last_trading_date() -> str:
-    d = datetime.now()
+    """
+    Return the most recent trading day for which market data is available.
+    TWSE/TPEX APIs update after market close (~15:30 Taiwan time).
+    Before 15:30, return the previous trading day so we don't store stale data.
+    """
+    tz = pytz.timezone("Asia/Taipei")
+    now = datetime.now(tz)
+    d = now
+    # Before 15:30, today's closing data isn't available yet — use previous day
+    if now.hour < 15 or (now.hour == 15 and now.minute < 30):
+        d -= timedelta(days=1)
+    # Roll back to the nearest weekday
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d.strftime("%Y-%m-%d")
@@ -80,19 +92,62 @@ def make_client() -> httpx.AsyncClient:
 # ── Stock price APIs ──────────────────────────────────────────
 
 async def fetch_twse_stocks_today() -> dict[str, dict]:
-    """Return {stock_code: {close, name}} for all TWSE stocks."""
+    """
+    Return {stock_code: {close, name}} for all TWSE stocks.
+    Tries STOCK_DAY_ALL first; if the data is stale (not today's date),
+    falls back to MI_INDEX which updates sooner after market close.
+    """
+    tz = pytz.timezone("Asia/Taipei")
+    today_roc = datetime.now(tz).strftime("%Y%m%d")
+    today_roc_short = f"{datetime.now(tz).year - 1911}{datetime.now(tz).strftime('%m%d')}"  # e.g. 1150601
+
     async with make_client() as client:
+        # ── Try STOCK_DAY_ALL first ──────────────────────────────
         try:
             resp = await client.get(TWSE_STOCK_ALL_URL)
+            rows = resp.json()
+            if rows:
+                first_date = rows[0].get("Date", "")  # ROC format e.g. "1150601"
+                if first_date == today_roc_short:
+                    result = {}
+                    for r in rows:
+                        code = r.get("Code", "")
+                        price = _float(r.get("ClosingPrice"))
+                        if code and price is not None and price > 0:
+                            result[code] = {"close": price, "name": r.get("Name", "")}
+                    print(f"[TWSE stocks] STOCK_DAY_ALL OK — {len(result)} stocks, date {first_date}")
+                    return result
+                else:
+                    print(f"[TWSE stocks] STOCK_DAY_ALL stale ({first_date}), falling back to MI_INDEX")
+        except Exception as e:
+            print(f"[TWSE stocks] STOCK_DAY_ALL error: {e}")
+
+        # ── Fallback: MI_INDEX (updates ~15-16:00 Taiwan time) ──
+        # Table fields: [證券代號, 證券名稱, 成交股數, ..., 收盤價(idx 8), ...]
+        try:
+            resp = await client.get(
+                "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX",
+                params={"date": today_roc, "type": "ALL", "response": "json"},
+            )
+            data = resp.json()
             result = {}
-            for r in resp.json():
-                code = r.get("Code", "")
-                price = _float(r.get("ClosingPrice"))
-                if code and price is not None and price > 0:
-                    result[code] = {"close": price, "name": r.get("Name", "")}
+            for table in data.get("tables", []):
+                fields = table.get("fields", [])
+                # Stock price table has 9+ columns and contains "收盤價"
+                if len(fields) < 9 or "收盤" not in str(fields):
+                    continue
+                for row in table.get("data", []):
+                    if len(row) < 9:
+                        continue
+                    code = str(row[0]).strip()
+                    name = str(row[1]).strip() if len(row) > 1 else ""
+                    price = _float(str(row[8]).replace(",", ""))
+                    if code and price and price > 0:
+                        result[code] = {"close": price, "name": name}
+            print(f"[TWSE stocks] MI_INDEX fallback — {len(result)} stocks")
             return result
         except Exception as e:
-            print(f"[TWSE stocks] {e}")
+            print(f"[TWSE stocks] MI_INDEX error: {e}")
             return {}
 
 
@@ -312,12 +367,14 @@ async def fetch_cbas_full_data() -> list[dict]:
         cb_code = str(ws.cell(row_idx, 1).value or "").strip()
         if not (len(cb_code) == 5 and cb_code.isdigit()):
             continue
-        cb_name     = str(ws.cell(row_idx, 2).value  or "").strip()
-        maturity    = ws.cell(row_idx, 4).value
-        conv_price  = _float(ws.cell(row_idx, 10).value)
-        stock_code  = str(ws.cell(row_idx, 11).value or "").strip().lstrip("'")
-        stock_ref   = _float(ws.cell(row_idx, 12).value)
-        cb_price    = _float(ws.cell(row_idx, 14).value)
+        cb_name          = str(ws.cell(row_idx, 2).value  or "").strip()
+        maturity         = ws.cell(row_idx, 4).value
+        outstanding_lots = _float(ws.cell(row_idx, 6).value)   # 流通餘額(張數)
+        outstanding_pct  = _float(ws.cell(row_idx, 7).value)   # 餘額比例 0-100
+        conv_price       = _float(ws.cell(row_idx, 10).value)
+        stock_code       = str(ws.cell(row_idx, 11).value or "").strip().lstrip("'")
+        stock_ref        = _float(ws.cell(row_idx, 12).value)
+        cb_price         = _float(ws.cell(row_idx, 14).value)
 
         # Normalise maturity date → YYYY-MM-DD
         maturity_str = None
@@ -327,10 +384,12 @@ async def fetch_cbas_full_data() -> list[dict]:
                 maturity_str = s
 
         result.append({
-            "cb_code":        cb_code,
-            "cb_name":        cb_name,
-            "stock_code":     stock_code,
-            "maturity_date":  maturity_str,
+            "cb_code":          cb_code,
+            "cb_name":          cb_name,
+            "stock_code":       stock_code,
+            "maturity_date":    maturity_str,
+            "outstanding_lots": int(outstanding_lots) if outstanding_lots else None,
+            "outstanding_pct":  outstanding_pct,
             "conversion_price": conv_price,
             "stock_ref_price":  stock_ref,
             "cb_price":         cb_price,
@@ -394,8 +453,8 @@ async def sync_all_from_cbas(trade_date: Optional[str] = None) -> dict:
             await db.execute(
                 """INSERT INTO convertible_bonds
                      (cb_code, cb_name, stock_code, stock_name, stock_market,
-                      maturity_date, conversion_price, is_active)
-                   VALUES (?,?,?,?,?,?,?,1)
+                      maturity_date, conversion_price, outstanding_lots, outstanding_pct, is_active)
+                   VALUES (?,?,?,?,?,?,?,?,?,1)
                    ON CONFLICT(cb_code) DO UPDATE SET
                      cb_name          = CASE WHEN cb_name='' THEN excluded.cb_name ELSE cb_name END,
                      stock_code       = excluded.stock_code,
@@ -405,19 +464,31 @@ async def sync_all_from_cbas(trade_date: Optional[str] = None) -> dict:
                      maturity_date    = CASE WHEN maturity_date IS NULL
                                              THEN excluded.maturity_date ELSE maturity_date END,
                      conversion_price = excluded.conversion_price,
+                     outstanding_lots = excluded.outstanding_lots,
+                     outstanding_pct  = excluded.outstanding_pct,
                      is_active        = 1,
                      updated_at       = datetime('now','localtime')""",
                 (cb_code, item["cb_name"], stock_code, stock_name, market,
-                 item.get("maturity_date"), conv_price),
+                 item.get("maturity_date"), conv_price,
+                 item.get("outstanding_lots"), item.get("outstanding_pct")),
             )
 
-            # Save CB price
+            # Save CB price — INSERT OR IGNORE so we don't overwrite a real MIS close price
+            # (13:35 job stores source='mis_close'; CBAS is a lower-priority fallback)
             if cb_price and cb_price > 0:
                 await db.execute(
-                    "INSERT OR REPLACE INTO cb_prices (cb_code, trade_date, close_price, source) VALUES (?,?,?,?)",
+                    "INSERT OR IGNORE INTO cb_prices (cb_code, trade_date, close_price, source) VALUES (?,?,?,?)",
                     (cb_code, trade_date, cb_price, "cbas"),
                 )
                 cb_saved += 1
+
+                # Use actual MIS close price if already stored, else CBAS/ref price
+                cur2 = await db.execute(
+                    "SELECT close_price FROM cb_prices WHERE cb_code=? AND trade_date=?",
+                    (cb_code, trade_date),
+                )
+                row2 = await cur2.fetchone()
+                actual_cb_price = row2[0] if row2 else cb_price
 
                 # Use API stock price first, fall back to CBAS reference price
                 stock_price = (all_stocks.get(stock_code) or {}).get("close") \
@@ -425,12 +496,12 @@ async def sync_all_from_cbas(trade_date: Optional[str] = None) -> dict:
 
                 if conv_price and conv_price > 0 and stock_price:
                     parity = stock_price * (100.0 / conv_price)
-                    premium_pct = (cb_price - parity) / parity * 100.0
+                    premium_pct = (actual_cb_price - parity) / parity * 100.0
                     await db.execute(
                         """INSERT OR REPLACE INTO premium_history
                            (cb_code, trade_date, cb_price, stock_price, conversion_price, parity, premium_pct)
                            VALUES (?,?,?,?,?,?,?)""",
-                        (cb_code, trade_date, cb_price, stock_price, conv_price, parity, premium_pct),
+                        (cb_code, trade_date, actual_cb_price, stock_price, conv_price, parity, premium_pct),
                     )
                     premium_saved += 1
 
@@ -1127,3 +1198,116 @@ async def sync_cb_list_from_isin(trade_date: Optional[str] = None) -> dict:
     result = {"status": "ok", "total": len(isin_codes), "new": len(new_cbs), "expired": len(expired)}
     print(f"[Sync ISIN] {result}")
     return result
+
+
+# ── OHLC chart data ───────────────────────────────────────────
+
+async def fetch_stock_ohlc(stock_code: str, market: str, days: int = 120) -> list[dict]:
+    """
+    Fetch daily OHLC for a TWSE or TPEX stock over the past N days.
+    TWSE: afterTrading/STOCK_DAY (monthly endpoint, fetch needed months)
+    TPEX: daily quotes
+    Returns list of {date, open, high, low, close} sorted ascending.
+    """
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    results: list[dict] = []
+
+    # Determine which month-start strings to query
+    today = datetime.now()
+    month_starts: list[str] = []
+    seen: set = set()
+    for i in range(days + 31):
+        d = today - timedelta(days=i)
+        key = d.strftime("%Y%m01")
+        if key not in seen:
+            seen.add(key)
+            month_starts.append(key)
+
+    async with make_client() as client:
+        if market == "TWSE":
+            for ms in sorted(month_starts):
+                try:
+                    resp = await client.get(
+                        "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY",
+                        params={"stockNo": stock_code, "date": ms, "response": "json"},
+                    )
+                    data = resp.json()
+                    if data.get("stat") != "OK":
+                        continue
+                    for row in data.get("data", []):
+                        try:
+                            parts = row[0].split("/")
+                            date_str = f"{int(parts[0])+1911}-{parts[1]}-{parts[2]}"
+                            if date_str < cutoff:
+                                continue
+                            o = _float(row[3].replace(",", ""))
+                            h = _float(row[4].replace(",", ""))
+                            l = _float(row[5].replace(",", ""))
+                            c = _float(row[6].replace(",", ""))
+                            vol = int(row[1].replace(",", "")) if row[1] else 0
+                            if c:
+                                results.append({"date": date_str, "open": o or c,
+                                                "high": h or c, "low": l or c,
+                                                "close": c, "volume": vol})
+                        except Exception:
+                            continue
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    continue
+        else:  # TPEX — use Yahoo Finance (one request, full OHLCV history)
+            from datetime import timezone
+            TW_TZ = timezone(timedelta(hours=8))
+            ticker = f"{stock_code}.TWO"
+            try:
+                resp = await client.get(
+                    f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+                    params={"interval": "1d", "range": "2y"},
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                        "Accept": "application/json",
+                    },
+                )
+                data = resp.json()
+                chart_result = data.get("chart", {}).get("result", [])
+                if chart_result:
+                    r0 = chart_result[0]
+                    timestamps = r0.get("timestamp", [])
+                    q = r0.get("indicators", {}).get("quote", [{}])[0]
+                    opens   = q.get("open",   [])
+                    highs   = q.get("high",   [])
+                    lows    = q.get("low",    [])
+                    closes  = q.get("close",  [])
+                    volumes = q.get("volume", [])
+                    for i, ts in enumerate(timestamps):
+                        try:
+                            date_str = datetime.fromtimestamp(ts, tz=TW_TZ).strftime("%Y-%m-%d")
+                            if date_str < cutoff:
+                                continue
+                            c = _float(closes[i]) if i < len(closes) else None
+                            o = _float(opens[i])   if i < len(opens)  else None
+                            h = _float(highs[i])   if i < len(highs)  else None
+                            l = _float(lows[i])    if i < len(lows)   else None
+                            vol = int(volumes[i])  if i < len(volumes) and volumes[i] else 0
+                            if c:
+                                results.append({
+                                    "date": date_str,
+                                    "open": o or c,
+                                    "high": h or c,
+                                    "low":  l or c,
+                                    "close": c,
+                                    "volume": vol,
+                                })
+                        except Exception:
+                            continue
+            except Exception as e:
+                print(f"[Yahoo OHLC {stock_code}] {e}")
+
+    results.sort(key=lambda x: x["date"])
+    # Deduplicate by date
+    seen_dates: set = set()
+    deduped = []
+    for r in results:
+        if r["date"] not in seen_dates:
+            seen_dates.add(r["date"])
+            deduped.append(r)
+    return deduped
