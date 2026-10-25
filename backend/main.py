@@ -121,6 +121,7 @@ async def lifespan(app: FastAPI):
 
 CBAS_CACHE_URL     = "https://raw.githubusercontent.com/a4s5d615/cb-tracker/master/data/cbas_cache.json"
 PREMIUM_HIST_URL   = "https://raw.githubusercontent.com/a4s5d615/cb-tracker/master/data/premium_history.json"
+CB_PRICES_HIST_URL = "https://raw.githubusercontent.com/a4s5d615/cb-tracker/master/data/cb_prices_history.json"
 
 
 async def _load_cbas_cache_from_github():
@@ -161,6 +162,34 @@ async def _load_cbas_cache_from_github():
     except Exception as e:
         print(f"[CBAS Cache] 載入失敗：{e}")
         return 0, 0
+
+
+async def _load_cb_prices_history_from_github():
+    """Render 啟動時從 GitHub 載入歷史 CB 價格，寫入 cb_prices 表。"""
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.get(CB_PRICES_HIST_URL)
+            if r.status_code != 200:
+                print(f"[CB Prices Hist] GitHub 回應 {r.status_code}，略過")
+                return 0
+            history = r.json()
+
+        print(f"[CB Prices Hist] 讀到 {len(history)} 天 CB 價格歷史")
+        total = 0
+        async with aiosqlite.connect(DB_PATH) as db:
+            for trade_date, prices in history.items():
+                for cb_code, close_price in prices.items():
+                    await db.execute(
+                        "INSERT OR IGNORE INTO cb_prices (cb_code, trade_date, close_price, source) VALUES (?,?,?,?)",
+                        (cb_code, trade_date, float(close_price), "cbas_hist"),
+                    )
+                    total += 1
+            await db.commit()
+        print(f"[CB Prices Hist] 已載入 {total} 筆歷史 CB 價格")
+        return total
+    except Exception as e:
+        print(f"[CB Prices Hist] 載入失敗：{e}")
+        return 0
 
 
 async def _load_premium_history_from_github():
@@ -204,7 +233,8 @@ async def _auto_start_if_needed():
         if result.get("status") != "ok" or result.get("cbs_synced", 0) == 0:
             print("[Startup] CBAS failed, falling back to ISIN discovery...")
             await _run_discovery_bg()
-        # 不管 CBAS 成不成功，都嘗試從 GitHub cache 補溢折價歷史 + 轉換價
+        # 不管 CBAS 成不成功，都嘗試從 GitHub cache 補歷史資料
+        asyncio.create_task(_load_cb_prices_history_from_github())
         asyncio.create_task(_load_premium_history_from_github())
         asyncio.create_task(_load_cbas_cache_from_github())
     else:
@@ -218,7 +248,8 @@ async def _auto_start_if_needed():
         else:
             print("[Startup] Prices up to date, syncing conversion prices...")
             asyncio.create_task(sync_conversion_prices_from_cbas())
-        # 每次啟動：先載入歷史溢折價，再補轉換價 + 流通餘額，再補近期缺漏
+        # 每次啟動：載入歷史 CB 價格 + 溢折價，再補轉換價 + 流通餘額
+        asyncio.create_task(_load_cb_prices_history_from_github())
         asyncio.create_task(_load_premium_history_from_github())
         asyncio.create_task(_load_cbas_cache_from_github())
         # 自動補充近 5 天歷史（補 GitHub cache 未涵蓋的最新幾天）

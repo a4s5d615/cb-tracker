@@ -7,7 +7,7 @@
 #   引數：C:/Users/a4s5d/cb-tracker/sync_to_render.py
 #   起始位置：C:/Users/a4s5d/cb-tracker
 import asyncio, io, json, logging, subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import httpx, openpyxl
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -16,6 +16,7 @@ log = logging.getLogger(__name__)
 RENDER_URL   = "https://cb-tracker-x7wp.onrender.com"
 CBAS_URL     = "https://cbas16889.pscnet.com.tw/api/MiDownloadExcel/GetExcel_IssuedCB"
 CACHE_PATH   = "data/cbas_cache.json"
+CB_HIST_PATH = "data/cb_prices_history.json"
 REPO_DIR     = "C:/Users/a4s5d/cb-tracker"
 HEADERS      = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
@@ -38,14 +39,15 @@ async def main():
         wb = openpyxl.load_workbook(io.BytesIO(r.content), data_only=True)
         ws = wb.active
 
-        prices, outstanding = {}, {}
+        prices, outstanding, cb_prices_today = {}, {}, {}
         for i in range(2, ws.max_row + 1):
             cb = str(ws.cell(i, 1).value or "").strip()
             if not cb:
                 continue
-            conv = _f(ws.cell(i, 10).value)
-            lots = _f(ws.cell(i, 6).value)
-            pct  = _f(ws.cell(i, 7).value)
+            conv     = _f(ws.cell(i, 10).value)
+            lots     = _f(ws.cell(i, 6).value)
+            pct      = _f(ws.cell(i, 7).value)
+            cb_price = _f(ws.cell(i, 14).value)   # CB 市價
             if conv and conv > 0:
                 prices[cb] = conv
             if lots is not None or pct is not None:
@@ -53,10 +55,18 @@ async def main():
                     "lots": int(lots) if lots is not None else None,
                     "pct":  pct,
                 }
+            if cb_price and cb_price > 0:
+                cb_prices_today[cb] = cb_price
 
-        log.info(f"CBAS: 轉換價 {len(prices)} 筆 / 流通餘額 {len(outstanding)} 筆")
+        # 取最近交易日（週末往回推）
+        d = datetime.now()
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        trade_date = d.strftime("%Y-%m-%d")
 
-        # ── 2. 存 JSON cache 並 push 到 GitHub ──────────────
+        log.info(f"CBAS: 轉換價 {len(prices)} 筆 / 流通餘額 {len(outstanding)} 筆 / CB價格 {len(cb_prices_today)} 筆 ({trade_date})")
+
+        # ── 2. 存 JSON cache + CB 價格歷史 並 push 到 GitHub ──
         cache = {
             "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
             "prices":      prices,
@@ -66,13 +76,24 @@ async def main():
             json.dump(cache, f, ensure_ascii=False, indent=2)
         log.info(f"已儲存 {CACHE_PATH}")
 
-        result = subprocess.run(
-            ["git", "-C", REPO_DIR, "add", CACHE_PATH],
-            capture_output=True, text=True
-        )
+        # 讀取舊的 CB 價格歷史，追加今天，保留 90 天
+        cb_hist_file = f"{REPO_DIR}/{CB_HIST_PATH}"
+        try:
+            with open(cb_hist_file, "r", encoding="utf-8") as f:
+                cb_prices_history = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            cb_prices_history = {}
+        cb_prices_history[trade_date] = cb_prices_today
+        cutoff = (datetime.now() - timedelta(days=92)).strftime("%Y-%m-%d")
+        cb_prices_history = {k: v for k, v in cb_prices_history.items() if k >= cutoff}
+        with open(cb_hist_file, "w", encoding="utf-8") as f:
+            json.dump(cb_prices_history, f, ensure_ascii=False, indent=2)
+        log.info(f"已儲存 {CB_HIST_PATH}（共 {len(cb_prices_history)} 天）")
+
+        subprocess.run(["git", "-C", REPO_DIR, "add", CACHE_PATH, CB_HIST_PATH], capture_output=True)
         result = subprocess.run(
             ["git", "-C", REPO_DIR, "commit", "-m",
-             f"chore: update CBAS cache {datetime.now().strftime('%Y-%m-%d')}"],
+             f"chore: update CBAS cache + CB prices {datetime.now().strftime('%Y-%m-%d')}"],
             capture_output=True, text=True
         )
         if "nothing to commit" in result.stdout:

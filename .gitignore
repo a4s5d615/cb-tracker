@@ -11,6 +11,7 @@ env/
 data/
 !data/cbas_cache.json
 !data/premium_history.json
+!data/cb_prices_history.json
 *.db
 *.sqlite
 
