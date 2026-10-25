@@ -124,6 +124,47 @@ async def main():
         )
         log.info(f"流通餘額推送：{r2.json().get('updated', 0)} 筆更新")
 
+        # ── 4. 觸發 backfill 並等待完成，再匯出溢折價歷史 ──────
+        log.info("觸發 Render 補充近期歷史資料...")
+        await client.post(f"{RENDER_URL}/api/discover/backfill-history",
+                          json={"days": 5}, timeout=30)
+
+        # 等 backfill 完成（最多 10 分鐘）
+        for attempt in range(60):
+            try:
+                st = (await client.get(f"{RENDER_URL}/api/discover/backfill-status", timeout=10)).json()
+                if not st.get("running"):
+                    log.info(f"Backfill 完成：{st.get('message')}")
+                    break
+                log.info(f"Backfill 進行中 {st.get('progress')}%... ({attempt+1}/60)")
+            except Exception:
+                pass
+            await asyncio.sleep(10)
+
+        # 匯出溢折價歷史並存到 GitHub
+        log.info("匯出溢折價歷史...")
+        r3 = await client.get(f"{RENDER_URL}/api/premium-history/export?days=90", timeout=120)
+        records = r3.json()
+        ph_path = "data/premium_history.json"
+        with open(f"{REPO_DIR}/{ph_path}", "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+        log.info(f"已儲存 {len(records)} 筆溢折價歷史到 {ph_path}")
+
+        subprocess.run(["git", "-C", REPO_DIR, "add", ph_path], capture_output=True)
+        result_ph = subprocess.run(
+            ["git", "-C", REPO_DIR, "commit", "-m",
+             f"chore: update premium history {datetime.now().strftime('%Y-%m-%d')}"],
+            capture_output=True, text=True
+        )
+        if "nothing to commit" in result_ph.stdout:
+            log.info("Premium history 無變化，不需 push")
+        else:
+            push_ph = subprocess.run(
+                ["git", "-C", REPO_DIR, "push", "origin", "master"],
+                capture_output=True, text=True
+            )
+            log.info(f"GitHub push (premium history): {push_ph.returncode == 0 and 'OK' or push_ph.stderr[:80]}")
+
         # 確認最終狀態
         stats = (await client.get(f"{RENDER_URL}/api/stats")).json()
         log.info(

@@ -119,7 +119,8 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown()
 
 
-CBAS_CACHE_URL = "https://raw.githubusercontent.com/a4s5d615/cb-tracker/master/data/cbas_cache.json"
+CBAS_CACHE_URL     = "https://raw.githubusercontent.com/a4s5d615/cb-tracker/master/data/cbas_cache.json"
+PREMIUM_HIST_URL   = "https://raw.githubusercontent.com/a4s5d615/cb-tracker/master/data/premium_history.json"
 
 
 async def _load_cbas_cache_from_github():
@@ -162,6 +163,35 @@ async def _load_cbas_cache_from_github():
         return 0, 0
 
 
+async def _load_premium_history_from_github():
+    """Render 啟動時從 GitHub raw 讀取溢折價歷史，直接寫入 DB（繞過 cb_prices/stock_prices 依賴）。"""
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.get(PREMIUM_HIST_URL)
+            if r.status_code != 200:
+                print(f"[Premium Hist] GitHub raw 回應 {r.status_code}，略過")
+                return 0
+            records = r.json()
+
+        print(f"[Premium Hist] 讀到 {len(records)} 筆歷史溢折價記錄")
+        async with aiosqlite.connect(DB_PATH) as db:
+            for rec in records:
+                await db.execute(
+                    """INSERT OR REPLACE INTO premium_history
+                       (cb_code, trade_date, cb_price, stock_price, conversion_price, parity, premium_pct)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (rec["cb_code"], rec["trade_date"], rec["cb_price"],
+                     rec["stock_price"], rec["conversion_price"],
+                     rec["parity"], rec["premium_pct"]),
+                )
+            await db.commit()
+        print(f"[Premium Hist] 已載入 {len(records)} 筆歷史記錄到 DB")
+        return len(records)
+    except Exception as e:
+        print(f"[Premium Hist] 載入失敗：{e}")
+        return 0
+
+
 async def _auto_start_if_needed():
     """On startup: use CBAS sync (works overseas) with ISIN as fallback."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -174,7 +204,8 @@ async def _auto_start_if_needed():
         if result.get("status") != "ok" or result.get("cbs_synced", 0) == 0:
             print("[Startup] CBAS failed, falling back to ISIN discovery...")
             await _run_discovery_bg()
-        # 不管 CBAS 成不成功，都嘗試從 GitHub cache 補轉換價
+        # 不管 CBAS 成不成功，都嘗試從 GitHub cache 補溢折價歷史 + 轉換價
+        asyncio.create_task(_load_premium_history_from_github())
         asyncio.create_task(_load_cbas_cache_from_github())
     else:
         trade_date = last_trading_date()
@@ -187,9 +218,10 @@ async def _auto_start_if_needed():
         else:
             print("[Startup] Prices up to date, syncing conversion prices...")
             asyncio.create_task(sync_conversion_prices_from_cbas())
-        # 每次啟動都從 GitHub cache 補轉換價 + 流通餘額
+        # 每次啟動：先載入歷史溢折價，再補轉換價 + 流通餘額，再補近期缺漏
+        asyncio.create_task(_load_premium_history_from_github())
         asyncio.create_task(_load_cbas_cache_from_github())
-        # 自動補充近 5 天歷史（確保圖表有資料）
+        # 自動補充近 5 天歷史（補 GitHub cache 未涵蓋的最新幾天）
         asyncio.create_task(_run_backfill_bg(5))
 
 
@@ -498,6 +530,21 @@ async def _run_backfill_bg(days: int):
         _backfill_status = {"running": False, "progress": -1, "days_done": 0,
                             "days_total": days, "message": f"錯誤: {e}", "last_result": None}
         print(f"[Backfill BG] Error: {e}")
+
+
+@app.get("/api/premium-history/export")
+async def export_premium_history(days: int = 90):
+    """匯出溢折價歷史（供 sync 腳本存到 GitHub cache）。"""
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT cb_code, trade_date, cb_price, stock_price,
+                      conversion_price, parity, premium_pct
+               FROM premium_history WHERE trade_date >= ? ORDER BY cb_code, trade_date ASC""",
+            (cutoff,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
 
 
 @app.post("/api/discover/fetch-date")

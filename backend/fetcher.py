@@ -1087,10 +1087,9 @@ async def fetch_historical_prices_for_date(trade_date: str) -> dict:
 
 async def backfill_history(days: int = 90, progress_callback=None) -> dict:
     """
-    Backfill historical stock prices for the past N trading days.
-    Uses TWSE afterTrading/MI_INDEX and TPEX daily quotes (both support date params).
-    After storing stock prices, re-runs premium calculation for any dates where
-    we also have CB prices stored (fills gaps in premium_history).
+    Backfill historical stock prices + CB prices for the past N trading days.
+    Uses TWSE afterTrading/MI_INDEX, TPEX daily quotes, and TPEX bond history.
+    After storing prices, re-runs premium calculation to fill premium_history.
     progress_callback(done, total, msg) called after each day.
     """
     today = datetime.now()
@@ -1103,10 +1102,19 @@ async def backfill_history(days: int = 90, progress_callback=None) -> dict:
             past_dates.append(d.strftime("%Y-%m-%d"))
         d -= timedelta(days=1)
 
+    # Load CB meta once (needed to filter TPEX CB prices to known CBs)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT cb_code, stock_code, conversion_price FROM convertible_bonds WHERE is_active=1"
+        )
+        cb_meta = {r["cb_code"]: dict(r) for r in await cur.fetchall()}
+
     total = len(past_dates)
-    print(f"[Backfill] Processing stock prices for {total} trading days")
+    print(f"[Backfill] Processing stock + CB prices for {total} trading days")
 
     stocks_total = 0
+    cb_total = 0
     days_done = 0
 
     for trade_date in past_dates:
@@ -1123,27 +1131,39 @@ async def backfill_history(days: int = 90, progress_callback=None) -> dict:
                     progress_callback(days_done, total, f"跳過已有資料 {trade_date} ({days_done}/{total})")
                 continue
 
-            # Parallel: TWSE + TPEX stocks for this date
+            # Parallel: TWSE stocks + TPEX stocks + TPEX CB bond prices for this date
             twse_task = fetch_twse_stocks_for_date(trade_date)
             tpex_task = fetch_tpex_stocks_for_date(trade_date)
-            twse_stocks, tpex_stocks = await asyncio.gather(twse_task, tpex_task)
+            tpex_cb_task = fetch_tpex_bond_prices_for_date(trade_date)
+            twse_stocks, tpex_stocks, tpex_cb_prices = await asyncio.gather(
+                twse_task, tpex_task, tpex_cb_task
+            )
             all_stocks = {**tpex_stocks, **twse_stocks}
 
-            if all_stocks:
-                async with aiosqlite.connect(DB_PATH) as db:
-                    for stock_code, close in all_stocks.items():
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Save stock prices
+                for stock_code, close in all_stocks.items():
+                    await db.execute(
+                        "INSERT OR REPLACE INTO stock_prices (stock_code, trade_date, close_price, source) VALUES (?,?,?,?)",
+                        (stock_code, trade_date, close,
+                         "twse" if stock_code in twse_stocks else "tpex"),
+                    )
+                # Save CB prices (only for CBs we track)
+                for cb_code, close in tpex_cb_prices.items():
+                    if cb_code in cb_meta:
                         await db.execute(
-                            "INSERT OR REPLACE INTO stock_prices (stock_code, trade_date, close_price, source) VALUES (?,?,?,?)",
-                            (stock_code, trade_date, close,
-                             "twse" if stock_code in twse_stocks else "tpex"),
+                            "INSERT OR REPLACE INTO cb_prices (cb_code, trade_date, close_price, source) VALUES (?,?,?,?)",
+                            (cb_code, trade_date, close, "tpex_hist"),
                         )
-                    await db.commit()
-                stocks_total += len(all_stocks)
+                await db.commit()
+
+            stocks_total += len(all_stocks)
+            cb_total += len([c for c in tpex_cb_prices if c in cb_meta])
 
             days_done += 1
             if progress_callback:
                 progress_callback(days_done, total,
-                    f"補充 {trade_date} 完成，{len(all_stocks)} 筆股價 ({days_done}/{total})")
+                    f"補充 {trade_date} 完成，{len(all_stocks)} 筆股價 / {len(tpex_cb_prices)} 筆CB價 ({days_done}/{total})")
             await asyncio.sleep(0.3)  # be polite to APIs
         except Exception as e:
             print(f"[Backfill] Error for {trade_date}: {e}")
@@ -1152,7 +1172,7 @@ async def backfill_history(days: int = 90, progress_callback=None) -> dict:
                 progress_callback(days_done, total, f"{trade_date} 錯誤: {e} ({days_done}/{total})")
 
     # Re-run premium backfill for all CBs that have stored prices
-    # This fills premium_history for any dates where CB prices + stock prices are both now available
+    # Now that cb_prices + stock_prices are both filled, premium_history will be complete
     print("[Backfill] Re-computing premiums for all stored CB prices...")
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -1170,6 +1190,7 @@ async def backfill_history(days: int = 90, progress_callback=None) -> dict:
         "status": "ok",
         "days_processed": days_done,
         "stock_prices_stored": stocks_total,
+        "cb_prices_stored": cb_total,
         "premiums_recalculated": prem_total,
     }
     print(f"[Backfill] Done: {result}")
