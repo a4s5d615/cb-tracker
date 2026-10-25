@@ -742,30 +742,56 @@ async function backfillHistory() {
   const btn = document.getElementById('btn-backfill');
   if (!confirm(
     '補充歷史股價資料（過去90個交易日）\n\n' +
-    '說明：系統剛建立，歷史CB價格無法從公開管道取得。\n' +
-    '本功能會補充過去90天的股價資料，讓日後的溢價圖表更完整。\n' +
-    '未來每個交易日 14:35 會自動抓取當日資料。\n\n' +
-    '這可能需要 2-3 分鐘，確定繼續？'
+    '本功能會補充過去90天的股價資料，讓溢價圖表更完整。\n' +
+    '每個交易日 15:45 系統會自動記錄當日資料。\n\n' +
+    '背景執行，不會卡住頁面，確定繼續？'
   )) return;
 
   btn.disabled = true;
   btn.textContent = '📥 補充中...';
 
+  // 通知 bar
   const notif = document.createElement('div');
-  notif.className = 'fixed bottom-4 right-4 bg-purple-800 text-white text-sm px-4 py-3 rounded-lg shadow-xl z-50 max-w-xs';
-  notif.textContent = '正在補充90天歷史股價（約2-3分鐘）...';
+  notif.id = 'backfill-notif';
+  notif.className = 'fixed bottom-4 right-4 bg-purple-800 text-white text-sm px-4 py-3 rounded-lg shadow-xl z-50 max-w-sm';
+  notif.innerHTML = '📥 歷史資料補充中…<br><span id="backfill-msg" class="text-purple-200 text-xs">啟動中...</span>';
   document.body.appendChild(notif);
 
   try {
-    const r = await post('/discover/backfill-history', { days: 90 });
-    const msg = `✓ 完成：補充 ${r.days_processed} 天股價（${(r.stock_prices_stored/1000).toFixed(0)}k 筆），重算 ${r.premiums_recalculated} 筆溢價`;
-    notif.textContent = msg;
-    notif.className = 'fixed bottom-4 right-4 bg-green-800 text-white text-sm px-4 py-3 rounded-lg shadow-xl z-50 max-w-xs';
-    setTimeout(() => notif.remove(), 8000);
-    await Promise.all([loadPremiumTable(), loadStats()]);
+    // 觸發後立即回傳（後台執行）
+    await post('/discover/backfill-history', { days: 90 });
+
+    // 輪詢進度
+    let done = false;
+    while (!done) {
+      await new Promise(r => setTimeout(r, 3000));
+      try {
+        const s = await get('/discover/backfill-status');
+        const msgEl = document.getElementById('backfill-msg');
+        if (!msgEl) break;
+
+        if (s.running) {
+          const pct = s.progress || 0;
+          msgEl.textContent = `${pct}% — ${s.message}`;
+          btn.textContent = `📥 ${pct}%`;
+        } else if (s.progress === 100) {
+          done = true;
+          const r = s.last_result || {};
+          notif.className = 'fixed bottom-4 right-4 bg-green-800 text-white text-sm px-4 py-3 rounded-lg shadow-xl z-50 max-w-sm';
+          notif.innerHTML = `✅ 完成！補充 ${r.days_processed || 0} 天，${r.premiums_recalculated || 0} 筆溢折價已更新`;
+          setTimeout(() => notif.remove(), 8000);
+          await Promise.all([loadPremiumTable(), loadStats()]);
+        } else if (s.progress === -1) {
+          done = true;
+          notif.className = 'fixed bottom-4 right-4 bg-red-800 text-white text-sm px-4 py-3 rounded-lg shadow-xl z-50 max-w-sm';
+          notif.innerHTML = `❌ 失敗：${s.message}`;
+          setTimeout(() => notif.remove(), 6000);
+        }
+      } catch (_) { /* ignore poll errors */ }
+    }
   } catch (e) {
     notif.textContent = '補充失敗: ' + e.message;
-    notif.className = 'fixed bottom-4 right-4 bg-red-800 text-white text-sm px-4 py-3 rounded-lg shadow-xl z-50 max-w-xs';
+    notif.className = 'fixed bottom-4 right-4 bg-red-800 text-white text-sm px-4 py-3 rounded-lg shadow-xl z-50 max-w-sm';
     setTimeout(() => notif.remove(), 5000);
   } finally {
     btn.textContent = '📥 補歷史資料';

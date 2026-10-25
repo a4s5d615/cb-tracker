@@ -38,6 +38,8 @@ scheduler = AsyncIOScheduler(timezone=TW_TZ)
 # ──────────────────────────────────────────────────────────
 
 _discovery_status = {"running": False, "progress": 0, "message": "idle", "last_result": None}
+_backfill_status  = {"running": False, "progress": 0, "days_done": 0, "days_total": 0,
+                     "message": "idle", "last_result": None}
 
 
 # ──────────────────────────────────────────────────────────
@@ -104,6 +106,12 @@ async def lifespan(app: FastAPI):
         _scheduled_daily_fetch, "cron",
         day_of_week="mon-fri", hour=15, minute=30,
         id="daily_fetch", replace_existing=True,
+    )
+    # 15:45 — 每日自動補充當日歷史記錄（確保股價更新後再跑）
+    scheduler.add_job(
+        lambda: asyncio.create_task(_run_backfill_bg(5)),
+        "cron", day_of_week="mon-fri", hour=15, minute=45,
+        id="daily_backfill", replace_existing=True,
     )
     scheduler.start()
     asyncio.create_task(_auto_start_if_needed())
@@ -181,6 +189,8 @@ async def _auto_start_if_needed():
             asyncio.create_task(sync_conversion_prices_from_cbas())
         # 每次啟動都從 GitHub cache 補轉換價 + 流通餘額
         asyncio.create_task(_load_cbas_cache_from_github())
+        # 自動補充近 5 天歷史（確保圖表有資料）
+        asyncio.create_task(_run_backfill_bg(5))
 
 
 async def _run_discovery_bg():
@@ -454,15 +464,40 @@ async def sync_conv_prices():
 
 
 @app.post("/api/discover/backfill-history")
-async def trigger_backfill(days: int = Body(60, embed=True)):
-    """
-    Backfill historical CB and stock prices for the past N trading days.
-    Fetches from TPEX OTC bond historical endpoint + TWSE/TPEX stock data.
-    Takes 1-3 minutes for 60 days. Runs synchronously (await completes when done).
-    """
+async def trigger_backfill(days: int = Body(90, embed=True)):
+    """立即回傳，後台跑 backfill，用 /api/discover/backfill-status 輪詢進度。"""
+    global _backfill_status
+    if _backfill_status["running"]:
+        return {"status": "already_running", **_backfill_status}
     days = max(1, min(days, 180))
-    result = await backfill_history(days)
-    return result
+    asyncio.create_task(_run_backfill_bg(days))
+    return {"status": "started", "days": days}
+
+
+@app.get("/api/discover/backfill-status")
+async def get_backfill_status():
+    return _backfill_status
+
+
+async def _run_backfill_bg(days: int):
+    global _backfill_status
+    _backfill_status = {"running": True, "progress": 0, "days_done": 0,
+                        "days_total": days, "message": "開始補充歷史股價...", "last_result": None}
+    try:
+        def on_progress(done: int, total: int, msg: str = ""):
+            global _backfill_status
+            pct = int(done / total * 100) if total else 0
+            _backfill_status = {**_backfill_status,
+                                "progress": pct, "days_done": done,
+                                "days_total": total, "message": msg or f"處理中 {done}/{total} 天"}
+        result = await backfill_history(days, progress_callback=on_progress)
+        _backfill_status = {"running": False, "progress": 100, "days_done": days,
+                            "days_total": days, "message": "完成！", "last_result": result}
+        print(f"[Backfill BG] Done: {result}")
+    except Exception as e:
+        _backfill_status = {"running": False, "progress": -1, "days_done": 0,
+                            "days_total": days, "message": f"錯誤: {e}", "last_result": None}
+        print(f"[Backfill BG] Error: {e}")
 
 
 @app.post("/api/discover/fetch-date")

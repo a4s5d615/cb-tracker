@@ -1085,12 +1085,13 @@ async def fetch_historical_prices_for_date(trade_date: str) -> dict:
     return summary
 
 
-async def backfill_history(days: int = 90) -> dict:
+async def backfill_history(days: int = 90, progress_callback=None) -> dict:
     """
     Backfill historical stock prices for the past N trading days.
     Uses TWSE afterTrading/MI_INDEX and TPEX daily quotes (both support date params).
     After storing stock prices, re-runs premium calculation for any dates where
     we also have CB prices stored (fills gaps in premium_history).
+    progress_callback(done, total, msg) called after each day.
     """
     today = datetime.now()
 
@@ -1102,13 +1103,26 @@ async def backfill_history(days: int = 90) -> dict:
             past_dates.append(d.strftime("%Y-%m-%d"))
         d -= timedelta(days=1)
 
-    print(f"[Backfill] Processing stock prices for {len(past_dates)} trading days")
+    total = len(past_dates)
+    print(f"[Backfill] Processing stock prices for {total} trading days")
 
     stocks_total = 0
     days_done = 0
 
     for trade_date in past_dates:
         try:
+            # Skip if stock prices already stored for this date
+            async with aiosqlite.connect(DB_PATH) as db:
+                cur = await db.execute(
+                    "SELECT COUNT(*) FROM stock_prices WHERE trade_date=?", (trade_date,)
+                )
+                existing = (await cur.fetchone())[0]
+            if existing > 100:  # already have data for this day
+                days_done += 1
+                if progress_callback:
+                    progress_callback(days_done, total, f"跳過已有資料 {trade_date} ({days_done}/{total})")
+                continue
+
             # Parallel: TWSE + TPEX stocks for this date
             twse_task = fetch_twse_stocks_for_date(trade_date)
             tpex_task = fetch_tpex_stocks_for_date(trade_date)
@@ -1127,9 +1141,15 @@ async def backfill_history(days: int = 90) -> dict:
                 stocks_total += len(all_stocks)
 
             days_done += 1
+            if progress_callback:
+                progress_callback(days_done, total,
+                    f"補充 {trade_date} 完成，{len(all_stocks)} 筆股價 ({days_done}/{total})")
             await asyncio.sleep(0.3)  # be polite to APIs
         except Exception as e:
             print(f"[Backfill] Error for {trade_date}: {e}")
+            days_done += 1
+            if progress_callback:
+                progress_callback(days_done, total, f"{trade_date} 錯誤: {e} ({days_done}/{total})")
 
     # Re-run premium backfill for all CBs that have stored prices
     # This fills premium_history for any dates where CB prices + stock prices are both now available
