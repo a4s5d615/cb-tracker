@@ -1,0 +1,91 @@
+name: Daily CB Data Export
+
+on:
+  schedule:
+    # 每個交易日 16:30 台灣時間（= UTC 08:30）執行
+    - cron: '30 8 * * 1-5'
+  workflow_dispatch:   # 允許手動觸發
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 允許 push 到 repo
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Wait for Render to wake up
+        run: |
+          for i in $(seq 1 6); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              "https://cb-tracker-x7wp.onrender.com/api/health" --max-time 15 || echo "000")
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then break; fi
+            sleep 30
+          done
+
+      - name: Export premium history from Render
+        run: |
+          curl -s "https://cb-tracker-x7wp.onrender.com/api/premium-history/export?days=90" \
+            -o data/premium_history.json
+          RECORDS=$(python3 -c "import json; d=json.load(open('data/premium_history.json')); print(len(d))" 2>/dev/null || echo 0)
+          echo "Exported $RECORDS premium records"
+          if [ "$RECORDS" = "0" ]; then
+            echo "No records, skipping commit"
+            exit 0
+          fi
+
+      - name: Export today's CB prices from Render
+        run: |
+          # Render 的 cb_prices 表有今天的資料（13:35 job 抓取）
+          TODAY=$(python3 -c "
+          from datetime import datetime, timedelta
+          import pytz
+          tz = pytz.timezone('Asia/Taipei')
+          now = datetime.now(tz)
+          d = now
+          while d.weekday() >= 5:
+              d -= timedelta(days=1)
+          print(d.strftime('%Y-%m-%d'))
+          " 2>/dev/null || date +%Y-%m-%d)
+
+          curl -s "https://cb-tracker-x7wp.onrender.com/api/cb-prices/export-today" \
+            -o /tmp/cb_prices_today.json
+
+          python3 -c "
+          import json, os
+          today = '$TODAY'
+          try:
+              prices_today = json.load(open('/tmp/cb_prices_today.json'))
+          except:
+              print('No CB prices today, skipping')
+              exit(0)
+          if not prices_today:
+              print('Empty CB prices, skipping')
+              exit(0)
+          try:
+              hist = json.load(open('data/cb_prices_history.json'))
+          except:
+              hist = {}
+          hist[today] = prices_today
+          # 只保留 92 天
+          from datetime import datetime, timedelta
+          cutoff = (datetime.now() - timedelta(days=92)).strftime('%Y-%m-%d')
+          hist = {k: v for k, v in hist.items() if k >= cutoff}
+          json.dump(hist, open('data/cb_prices_history.json', 'w'), ensure_ascii=False, indent=2)
+          print(f'Saved {len(prices_today)} CB prices for {today}, total {len(hist)} days in history')
+          "
+
+      - name: Commit and push data
+        run: |
+          git config user.name "CB Tracker Bot"
+          git config user.email "bot@cb-tracker.local"
+          git add data/premium_history.json data/cb_prices_history.json
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: auto-export daily data $(date +%Y-%m-%d)"
+            git push
+          fi

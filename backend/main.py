@@ -563,6 +563,19 @@ async def _run_backfill_bg(days: int):
         print(f"[Backfill BG] Error: {e}")
 
 
+@app.get("/api/cb-prices/export-today")
+async def export_cb_prices_today():
+    """匯出最新交易日的 CB 收盤價（供 GitHub Actions 每日存檔）。"""
+    trade_date = last_trading_date()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT cb_code, close_price FROM cb_prices WHERE trade_date=? AND close_price IS NOT NULL",
+            (trade_date,),
+        )
+        return {r["cb_code"]: r["close_price"] for r in await cur.fetchall()}
+
+
 @app.get("/api/premium-history/export")
 async def export_premium_history(days: int = 90):
     """匯出溢折價歷史（供 sync 腳本存到 GitHub cache）。"""
