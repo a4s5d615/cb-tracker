@@ -8,7 +8,7 @@ env/
 *.egg-info/
 
 # Database (don't commit local DB — Railway uses a volume)
-data/
+data/*
 !data/cbas_cache.json
 !data/premium_history.json
 !data/cb_prices_history.json
